@@ -1,0 +1,59 @@
+# 构建输出
+build/
+dist/
+*.o
+*.so
+*.a
+*.exe
+
+# 日志文件
+logs/
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*~
+.DS_Store
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 编译数据库
+compile_commands.json
+
+# 测试输出
+test_results/
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# 运行时文件
+*.pid
+kernel_features.env
+
+# 包文件
+*.tar.gz
+*.deb
+*.rpm
+
+# 环境文件
+.env
+.env.local
+
+# CMake缓存
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# 备份文件
+*.backup
+
+# 忽略素材文件夹
+/1-6级tif文件
+/dwg文件
