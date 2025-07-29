@@ -6,7 +6,7 @@ noheader_encrypt_tif.py - 对整个 TIFF 文件进行异或加密（包括 TIFF 
 用法：
     python3 noheader_encrypt_tif.py 原图像路径
 
-    python3 noheader_encrypt_tif.py ./1-6级tif文件/Level_2.tif
+    python3 noheader_encrypt_tif.py ./tif_tests/Level_2.tif
 
 输出：
     输出文件名格式为：noheader_changed_原文件名.tif
@@ -14,8 +14,8 @@ noheader_encrypt_tif.py - 对整个 TIFF 文件进行异或加密（包括 TIFF 
 
 """
 使用 hexdump 查看加密前后文件内容，是否按 XOR_KEY = 0xFF 加密：
-    hexdump -C ./1-6级tif文件/Level_2.tif | head -n 2
-    hexdump -C ./1-6级tif文件/noheader_changed_Level_2.tif | head -n 2
+    hexdump -C ./tif_tests/Level_2.tif | head -n 2
+    hexdump -C ./tif_tests/noheader_changed_Level_2.tif | head -n 2
 """
 
 import os
