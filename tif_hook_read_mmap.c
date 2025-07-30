@@ -1,4 +1,8 @@
+// tif_hook_read_mmap.c
+// 这是一个用于处理加密 TIFF 文件的 read、mmap Hook 实现
+// 目前用于测试在麒麟照片查看器中解密 TIF 文件
 // LD_PRELOAD=/home/chane/tif_crypto_hook/libtif_hook.so /usr/bin/kylin-photo-viewer "/home/chane/tif_crypto_hook/tif_tests/noheader_changed_Level_2.tif"
+// gcc -fPIC -shared -o libtif_hook.so tif_hook_read_mmap.c -ldl
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -9,7 +13,10 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <stdint.h>
-#include <errno.h>  // 修复 errno 未定义问题
+#include <errno.h>
+#include <sys/types.h>  // 必须包含
+#include <sys/stat.h>
+#include <limits.h>
 
 // =============== 配置 ===============
 #define XOR_KEY 0xFF  // 你的加密密钥
@@ -17,6 +24,7 @@
 
 // 函数指针，用于调用真实的 read 和 mmap
 static ssize_t (*real_read)(int fd, void *buf, size_t count) = NULL;
+static size_t (*real_fread)(void *ptr, size_t size, size_t nmemb, FILE *stream) = NULL;
 static void* (*real_mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
 
 /**
@@ -33,7 +41,7 @@ void xor_decrypt(void *buf, size_t len, uint8_t key) {
 }
 
 /**
- * @brief 通过文件描述符获取文件路径（增强健壮性和调试信息）
+ * @brief 通过文件描述符获取文件路径
  * @param fd 文件描述符
  * @return 成功返回路径字符串（需 free），失败返回 NULL
  */
@@ -48,14 +56,13 @@ char* get_file_path_by_fd(int fd) {
     // 读取符号链接
     len = readlink(link_path, file_path, sizeof(file_path) - 1);
     if (len == -1) {
-        fprintf(stderr, "[HOOK] readlink 失败: %s (fd=%d, path=%s)\n", strerror(errno), fd, link_path);
+        fprintf(stderr, "[HOOK] readlink 失败: %s (fd=%d)\n", strerror(errno), fd);
         return NULL;
     }
     file_path[len] = '\0';
 
-    // 【调试】打印获取到的路径
-    fprintf(stderr, "[HOOK] 获取到 fd=%d 的路径: '%s'\n", fd, file_path);
-
+    // 如果路径以 /dev/ 开头（如 /dev/shm），或包含 (deleted)，可能不是真实文件
+    // 但我们也尝试匹配
     return strdup(file_path); // 返回副本
 }
 
@@ -66,9 +73,8 @@ char* get_file_path_by_fd(int fd) {
  */
 int is_target_file(const char *path) {
     if (!path) return 0;
-    // 匹配你加密的文件名特征（更宽松的匹配）
-    return (strstr(path, "noheader_changed_") != NULL) ||
-           (strstr(path, "Level_") != NULL); // 可以根据需要添加更多特征
+    // 匹配你加密的文件名特征
+    return strstr(path, "noheader_changed_") != NULL;
 }
 
 // ==================== Hook 函数 ====================
@@ -77,6 +83,7 @@ int is_target_file(const char *path) {
  * @brief Hooked read 函数
  */
 ssize_t read(int fd, void *buf, size_t count) {
+    // fprintf(stderr, "[DEBUG] read() called on fd=%d, count=%zu\n", fd, count);
     // 获取真实 read 函数
     if (!real_read) {
         real_read = dlsym(RTLD_NEXT, "read");
@@ -96,20 +103,21 @@ ssize_t read(int fd, void *buf, size_t count) {
     char *file_path = NULL;
     int should_decrypt = 0;
 
-    // 核心：通过文件路径判断是否为目标文件
+    // 方法1: 通过文件路径判断（通用）
     file_path = get_file_path_by_fd(fd);
     if (file_path && is_target_file(file_path)) {
         should_decrypt = 1;
-        fprintf(stderr, "[HOOK] ✅ 拦截目标文件 read(fd=%d, count=%zu): %s\n", fd, count, file_path);
+        fprintf(stderr, "[HOOK] 拦截 read(fd=%d, count=%zu) from file: %s\n", fd, count, file_path);
     }
-    // --- 移除了对 fd==10 的强制判断 ---
-    // 这个判断不通用，且可能误伤非目标文件（如 XML）
-    // else if (fd == 10) { ... }
-    // -------------------------------
+    // 方法2: 强制对特定 fd 解密（调试用，基于你的 strace 输出 fd=10）
+    else if (fd == 10) {
+        should_decrypt = 1;
+        fprintf(stderr, "[HOOK] 强制拦截 fd=%d 的 read(count=%zu)，可能为 TIFF 文件\n", fd, count);
+    }
 
     if (should_decrypt) {
-        // 记录解密前数据（前8字节）
-        fprintf(stderr, "[HOOK]     解密前8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+        // 记录解密前数据
+        fprintf(stderr, "[HOOK] 解密前8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                 ((unsigned char*)buf)[0], ((unsigned char*)buf)[1],
                 ((unsigned char*)buf)[2], ((unsigned char*)buf)[3],
                 ((unsigned char*)buf)[4], ((unsigned char*)buf)[5],
@@ -117,9 +125,10 @@ ssize_t read(int fd, void *buf, size_t count) {
 
         // 执行解密
         xor_decrypt(buf, result, XOR_KEY);
+        // memset(buf, 'X', result); // 测试：把所有读到的数据变成 'X'
 
-        // 记录解密后数据（前8字节）
-        fprintf(stderr, "[HOOK]     解密后8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+        // 记录解密后数据
+        fprintf(stderr, "[HOOK] 解密后8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                 ((unsigned char*)buf)[0], ((unsigned char*)buf)[1],
                 ((unsigned char*)buf)[2], ((unsigned char*)buf)[3],
                 ((unsigned char*)buf)[4], ((unsigned char*)buf)[5],
@@ -128,6 +137,36 @@ ssize_t read(int fd, void *buf, size_t count) {
     // ==================== 解密逻辑结束 ====================
 
     if (file_path) free(file_path); // 释放路径内存
+    return result;
+}
+
+/**
+ * @brief Hooked fread 函数
+ */
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (!real_fread) {
+        real_fread = dlsym(RTLD_NEXT, "fread");
+        if (!real_fread) {
+            fprintf(stderr, "[HOOK] 错误：无法找到真实的 fread！\n");
+            return 0;
+        }
+    }
+
+    size_t result = real_fread(ptr, size, nmemb, stream);
+    if (result == 0) return result;
+
+    // 获取文件路径（通过 fileno）
+    int fd = fileno(stream);
+    char *path = get_file_path_by_fd(fd);
+    if (path && is_target_file(path)) {
+        fprintf(stderr, "[HOOK] 拦截 fread(size=%zu, nmemb=%zu) from %s\n", size, nmemb, path);
+        fprintf(stderr, "[HOOK] fread 前8字节: %02x %02x %02x %02x ...\n",
+                ((uint8_t*)ptr)[0], ((uint8_t*)ptr)[1], ((uint8_t*)ptr)[2], ((uint8_t*)ptr)[3]);
+        xor_decrypt(ptr, result * size, XOR_KEY);
+        fprintf(stderr, "[HOOK] fread 后8字节: %02x %02x %02x %02x ...\n",
+                ((uint8_t*)ptr)[0], ((uint8_t*)ptr)[1], ((uint8_t*)ptr)[2], ((uint8_t*)ptr)[3]);
+    }
+    if (path) free(path);
     return result;
 }
 
@@ -156,17 +195,22 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         char *file_path = NULL;
         int should_decrypt = 0;
 
-        // 核心：通过文件路径判断是否为目标文件
+        // 方法1: 通过文件路径判断
         file_path = get_file_path_by_fd(fd);
         if (file_path && is_target_file(file_path)) {
             should_decrypt = 1;
-            fprintf(stderr, "[HOOK] ✅ 拦截目标文件 mmap(fd=%d, offset=%ld, length=%zu): %s\n",
+            fprintf(stderr, "[HOOK] 拦截 mmap(fd=%d, offset=%ld, length=%zu) from file: %s\n",
                     fd, offset, length, file_path);
+        }
+        // 方法2: 强制对 fd=10 解密
+        else if (fd == 10) {
+            should_decrypt = 1;
+            fprintf(stderr, "[HOOK] 强制拦截 fd=%d 的 mmap(length=%zu, offset=%ld)\n", fd, length, offset);
         }
 
         if (should_decrypt) {
-            // 记录映射前数据（前8字节）
-            fprintf(stderr, "[HOOK]     mmap 映射前8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            // 记录映射前数据
+            fprintf(stderr, "[HOOK] mmap 映射前8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                     ((unsigned char*)result)[0], ((unsigned char*)result)[1],
                     ((unsigned char*)result)[2], ((unsigned char*)result)[3],
                     ((unsigned char*)result)[4], ((unsigned char*)result)[5],
@@ -175,8 +219,8 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             // 执行解密
             xor_decrypt(result, length, XOR_KEY);
 
-            // 记录解密后数据（前8字节）
-            fprintf(stderr, "[HOOK]     mmap 解密后8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            // 记录解密后数据
+            fprintf(stderr, "[HOOK] mmap 解密后8字节: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                     ((unsigned char*)result)[0], ((unsigned char*)result)[1],
                     ((unsigned char*)result)[2], ((unsigned char*)result)[3],
                     ((unsigned char*)result)[4], ((unsigned char*)result)[5],
@@ -195,7 +239,6 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
  */
 __attribute__((constructor))
 void so_loaded() {
-    fprintf(stderr, "[HOOK] 🚀 libtif_hook.so 已被成功加载！\n");
-    fprintf(stderr, "[HOOK] 🛠️  配置: XOR_KEY=0x%02x\n", XOR_KEY);
-    fprintf(stderr, "[HOOK] 🔍 注意：仅对包含 'noheader_changed_' 或 'Level_' 的文件进行解密。\n");
+    fprintf(stderr, "[HOOK] libtif_hook.so 已被成功加载！\n");
+    fprintf(stderr, "[HOOK] 配置: XOR_KEY=0x%02x\n", XOR_KEY);
 }
