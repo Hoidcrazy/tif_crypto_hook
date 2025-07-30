@@ -19,7 +19,7 @@
 #include <limits.h>
 
 // =============== 配置 ===============
-#define XOR_KEY 0xFF  // 你的加密密钥
+#define XOR_KEY 0xFF  // XOR加密密钥
 // ====================================
 
 // 函数指针，用于调用真实的 read 和 mmap
