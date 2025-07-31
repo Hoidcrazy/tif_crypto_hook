@@ -6,7 +6,7 @@ encrypt_dwg.py - 对 dwg_tests 文件夹下所有 DWG 文件进行异或加密�
     python3 encrypt_dwg.py
 
 输出：
-    输出文件名格式为：noheader_changed_原文件名.dwg
+    输出文件名格式为：changed_原文件名.dwg
 """
 
 
@@ -19,7 +19,7 @@ XOR_KEY = 0xFF
 def xor_encrypt_file(file_path, xor_key):
     # 加密后的文件路径
     encrypted_file_path = os.path.join(os.path.dirname(file_path),
-                                        'noheader_changed_' + os.path.basename(file_path))
+                                        'changed_' + os.path.basename(file_path))
     
     with open(file_path, 'rb') as file:
         data = bytearray(file.read())
@@ -40,7 +40,7 @@ def main():
     for dwg_file in dwg_files:
         print(f"正在处理文件: {dwg_file}")
         xor_encrypt_file(dwg_file, XOR_KEY)
-        print(f"处理完成并保存为: noheader_changed_{os.path.basename(dwg_file)}")
+        print(f"处理完成并保存为: changed_{os.path.basename(dwg_file)}")
 
 if __name__ == '__main__':
     main()
