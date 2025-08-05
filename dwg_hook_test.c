@@ -1,7 +1,7 @@
-// 文件路径: /home/chane/tif_crypto_hook/dwg_hook.c
+// 文件路径: /home/chane/tif_crypto_hook/dwg_hook_test.c
 
 // 编译命令:
-//   gcc -shared -fPIC -o libdwg_hook.so dwg_hook.c -ldl -lpthread
+//   gcc -shared -fPIC -o libdwg_hook.so dwg_hook_test.c -ldl -lpthread
 //
 // 使用方法（挂载到中望CAD启动脚本）:
 //   1. 修改启动脚本 sudo vim /opt/apps/zwcad2025/ZWCADRUN.sh
@@ -16,7 +16,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
-#include <fcntl.h>  
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
