@@ -16,7 +16,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
-#include <fcntl.h>
+#include <fcntl.h>  
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -466,7 +466,7 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
         unsigned char *data = (unsigned char *)buf;
 
         // 打印解密前的数据
-        DEBUG_LOG("解密前: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密前: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
 
         for (ssize_t i = 0; i < ret; ++i) {
@@ -474,7 +474,7 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
         }
 
         // 打印解密后的数据
-        DEBUG_LOG("解密后: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密后: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
 
         DEBUG_LOG("Decryption completed for file: %s", path);
@@ -513,7 +513,7 @@ ssize_t read(int fd, void *buf, size_t count) {
         unsigned char *data = (unsigned char *)buf;
 
         // 打印解密前的数据
-        DEBUG_LOG("解密前: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密前: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
         
         for (ssize_t i = 0; i < ret; ++i) {
@@ -521,7 +521,7 @@ ssize_t read(int fd, void *buf, size_t count) {
         }
 
         // 打印解密后的数据
-        DEBUG_LOG("解密后: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密后: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
 
         DEBUG_LOG("Decryption completed for file: %s", path);
@@ -647,6 +647,160 @@ int munmap(void *addr, size_t length) {
     return ret;
 }
 
+// ==================== 新增的写入加密功能 ====================
+
+/**
+ * 拦截 write 系统调用
+ * 功能:
+ *   - 检查 fd 是否对应目标加密文件
+ *   - 如果是，则复制用户缓冲区并加密副本
+ *   - 调用真实 write 写入加密后的数据
+ *   - 返回原始 write 的返回值
+ * 
+ * 注意: 
+ *   - 不修改原始用户缓冲区，避免影响程序行为
+ *   - 使用临时缓冲区存储加密数据
+ */
+ssize_t write(int fd, const void *buf, size_t count) {
+    static ssize_t (*real_write)(int, const void *, size_t) = NULL;
+    if (!real_write)
+        real_write = dlsym(RTLD_NEXT, "write");
+
+    // 获取文件路径用于判断
+    char path_buf[PATH_MAX] = {0};
+    const char *path = get_fd_path(fd, path_buf, sizeof(path_buf));
+    int is_target = path && is_target_dwg_file(path);
+    
+    DEBUG_LOG("write(fd=%d, count=%zu, path=%s, is_target=%d)",
+              fd, count, path ? path : "(unknown)", is_target);
+
+    // 非目标文件或无效参数：直接调用原始函数
+    if (!is_target || count == 0 || !buf) {
+        return real_write(fd, buf, count);
+    }
+
+    // 分配临时缓冲区
+    void *encrypted_buf = malloc(count);
+    if (!encrypted_buf) {
+        DEBUG_LOG("write: malloc failed for size %zu", count);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    // 复制并加密数据
+    memcpy(encrypted_buf, buf, count);
+    unsigned char *data = (unsigned char *)encrypted_buf;
+    for (size_t i = 0; i < count; i++) {
+        data[i] ^= 0xFF;
+    }
+
+    // 调试输出前16字节
+    DEBUG_LOG("加密后写入: 前3字节: %02x %02x %02x ... (原始: %02x %02x %02x ...)",
+              data[0], data[1], data[2],
+              ((unsigned char *)buf)[0], ((unsigned char *)buf)[1], ((unsigned char *)buf)[2]);
+
+    // 调用真实 write
+    ssize_t ret = real_write(fd, encrypted_buf, count);
+    free(encrypted_buf);
+
+    DEBUG_LOG("write: 返回 %zd %s", ret, ret < 0 ? strerror(errno) : "");
+    return ret;
+}
+
+/**
+ * 拦截 pwrite64 系统调用
+ * 实现逻辑与 write 相同，增加 offset 参数处理
+ */
+ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
+    static ssize_t (*real_pwrite64)(int, const void *, size_t, off_t) = NULL;
+    if (!real_pwrite64)
+        real_pwrite64 = dlsym(RTLD_NEXT, "pwrite64");
+
+    // 获取文件路径用于判断
+    char path_buf[PATH_MAX] = {0};
+    const char *path = get_fd_path(fd, path_buf, sizeof(path_buf));
+    int is_target = path && is_target_dwg_file(path);
+    
+    DEBUG_LOG("pwrite64(fd=%d, offset=%ld, count=%zu, path=%s, is_target=%d)",
+              fd, (long)offset, count, path ? path : "(unknown)", is_target);
+
+    // 非目标文件或无效参数：直接调用原始函数
+    if (!is_target || count == 0 || !buf) {
+        return real_pwrite64(fd, buf, count, offset);
+    }
+
+    // 分配临时缓冲区
+    void *encrypted_buf = malloc(count);
+    if (!encrypted_buf) {
+        DEBUG_LOG("pwrite64: malloc failed for size %zu", count);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    // 复制并加密数据
+    memcpy(encrypted_buf, buf, count);
+    unsigned char *data = (unsigned char *)encrypted_buf;
+    for (size_t i = 0; i < count; i++) {
+        data[i] ^= 0xFF;
+    }
+
+    // 调试输出
+    DEBUG_LOG("pwrite64加密: 前3字节: %02x %02x %02x ... (原始: %02x %02x %02x ...)",
+              data[0], data[1], data[2],
+              ((unsigned char *)buf)[0], ((unsigned char *)buf)[1], ((unsigned char *)buf)[2]);
+
+    // 调用真实 pwrite64
+    ssize_t ret = real_pwrite64(fd, encrypted_buf, count, offset);
+    free(encrypted_buf);
+
+    DEBUG_LOG("pwrite64: 返回 %zd %s", ret, ret < 0 ? strerror(errno) : "");
+    return ret;
+}
+
+/**
+ * 拦截 msync 系统调用
+ * 功能:
+ *   - 检查内存区域是否属于目标加密文件
+ *   - 如果是，则加密内存区域后同步
+ *   - 同步完成后立即解密恢复内存
+ * 
+ * 注意:
+ *   - 使用 mprotect 临时修改内存保护权限
+ *   - 确保内存解密后恢复原始保护状态
+ */
+int msync(void *addr, size_t length, int flags) {
+    static int (*real_msync)(void *, size_t, int) = NULL;
+    if (!real_msync)
+        real_msync = dlsym(RTLD_NEXT, "msync");
+
+    DEBUG_LOG("msync: addr=%p, len=%zu, flags=0x%x", addr, length, flags);
+
+    // 检查是否需要解密
+    int need_decrypt = is_mmap_region_need_decrypt(addr, length);
+    DEBUG_LOG("msync: need_decrypt=%d for %p+%zu", need_decrypt, addr, length);
+
+    int ret = 0;
+    if (need_decrypt) {
+        // 1. 加密内存区域
+        if (safe_decrypt_mmap_region(addr, length) != 0) {
+            DEBUG_LOG("msync: 加密失败，继续同步但数据可能未加密!");
+        }
+        
+        // 2. 执行同步
+        ret = real_msync(addr, length, flags);
+        
+        // 3. 立即解密恢复内存
+        if (safe_decrypt_mmap_region(addr, length) != 0) {
+            DEBUG_LOG("msync: 解密恢复失败! 内存数据可能损坏!");
+        }
+    } else {
+        // 非目标区域直接同步
+        ret = real_msync(addr, length, flags);
+    }
+
+    DEBUG_LOG("msync: 返回 %d %s", ret, ret < 0 ? strerror(errno) : "");
+    return ret;
+}
 
 /**
  * 拦截 close 系统调用

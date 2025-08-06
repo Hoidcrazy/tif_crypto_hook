@@ -466,7 +466,7 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
         unsigned char *data = (unsigned char *)buf;
 
         // 打印解密前的数据
-        DEBUG_LOG("解密前: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密前: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
 
         for (ssize_t i = 0; i < ret; ++i) {
@@ -474,7 +474,7 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
         }
 
         // 打印解密后的数据
-        DEBUG_LOG("解密后: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密后: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
 
         DEBUG_LOG("Decryption completed for file: %s", path);
@@ -513,7 +513,7 @@ ssize_t read(int fd, void *buf, size_t count) {
         unsigned char *data = (unsigned char *)buf;
 
         // 打印解密前的数据
-        DEBUG_LOG("解密前: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密前: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
         
         for (ssize_t i = 0; i < ret; ++i) {
@@ -521,7 +521,7 @@ ssize_t read(int fd, void *buf, size_t count) {
         }
 
         // 打印解密后的数据
-        DEBUG_LOG("解密后: 缓冲区前16字节: %02x %02x %02x ...",
+        DEBUG_LOG("解密后: 缓冲区前3字节: %02x %02x %02x ...",
             data[0], data[1], data[2]);
 
         DEBUG_LOG("Decryption completed for file: %s", path);
