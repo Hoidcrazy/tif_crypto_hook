@@ -12,6 +12,20 @@
 //   设置环境变量开启调试日志: export DWG_HOOK_DEBUG=1
 //   重定向输出查看日志: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so /opt/apps/zwcad2025/ZWCADRUN.sh
 
+// 文件路径: /home/chane/tif_crypto_hook/dwg_hook_test.c
+
+// 编译命令:
+//   gcc -shared -fPIC -o libdwg_hook.so dwg_hook_test.c -ldl -lpthread
+//
+// 使用方法（挂载到中望CAD启动脚本）:
+//   1. 修改启动脚本 sudo vim /opt/apps/zwcad2025/ZWCADRUN.sh
+//   2. 注释原启动行: # ./ZWCAD "$@" /product ZWCAD
+//   3. 添加新行: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so ./ZWCAD "$@" /product ZWCAD
+//
+// 调试方法:
+//   设置环境变量开启调试日志: export DWG_HOOK_DEBUG=1
+//   重定向输出查看日志: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so /opt/apps/zwcad2025/ZWCADRUN.sh
+
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
@@ -43,20 +57,15 @@ static pthread_mutex_t fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 // 调试标志：控制是否输出调试日志
 static int debug_enabled = -1;
 
-// 加密文件魔数标识
-#define MAGIC_HEADER 0xBECEBEBC
-#define INODE_CACHE_SIZE 1024   // inode缓存大小
-
-// 文件头特征识别
-static const unsigned char ENCRYPTED_HEADER[4] = {0xBE, 0xCE, 0xBE, 0xBC};
+// inode缓存大小
+#define INODE_CACHE_SIZE 1024
 
 // inode缓存结构
 typedef struct {
     ino_t inode;      // 文件inode号
-    bool encrypted;   // 是否加密文件
 } inode_cache_t;
 
-static inode_cache_t inode_cache[INODE_CACHE_SIZE] = {{0, false}};
+static inode_cache_t inode_cache[INODE_CACHE_SIZE] = {{0}};
 static pthread_mutex_t inode_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 修改mmap跟踪结构
@@ -135,68 +144,6 @@ int is_target_dwg_file(const char *path) {
 
     DEBUG_LOG("目标DWG文件已识别: %s", path);
     return 1;
-}
-
-/**
- * 通过inode检查文件是否加密
- */
-bool is_encrypted_by_inode(int fd) {
-    struct stat file_stat;
-    if (fstat(fd, &file_stat) != 0) {
-        DEBUG_LOG("fstat失败 fd=%d: %s", fd, strerror(errno));
-        return false;
-    }
-    
-    ino_t inode = file_stat.st_ino;
-    
-    // 检查缓存
-    pthread_mutex_lock(&inode_mutex);
-    for (int i = 0; i < INODE_CACHE_SIZE; i++) {
-        if (inode_cache[i].inode == inode) {
-            bool result = inode_cache[i].encrypted;
-            pthread_mutex_unlock(&inode_mutex);
-            DEBUG_LOG("inode缓存命中: inode=%lu, 加密=%d", inode, result);
-            return result;
-        }
-    }
-    pthread_mutex_unlock(&inode_mutex);
-    
-    // 没有缓存，读取文件头判断
-    unsigned char header[4];
-    ssize_t bytes_read = pread(fd, header, 4, 0);
-    if (bytes_read != 4) {
-        DEBUG_LOG("文件头读取失败 inode=%lu", inode);
-        return false;
-    }
-    
-    bool encrypted = (memcmp(header, ENCRYPTED_HEADER, 4) == 0);
-    
-    // 更新缓存
-    pthread_mutex_lock(&inode_mutex);
-    for (int i = 0; i < INODE_CACHE_SIZE; i++) {
-        if (inode_cache[i].inode == 0) {
-            inode_cache[i].inode = inode;
-            inode_cache[i].encrypted = encrypted;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&inode_mutex);
-    
-    DEBUG_LOG("文件特征识别: inode=%lu, 加密=%d", inode, encrypted);
-    return encrypted;
-}
-
-/**
- * 判断文件是否需要加解密处理
- */
-bool needs_crypto_processing(int fd, const char *path) {
-    // 优先使用文件头特征识别
-    if (fd >= 0 && is_encrypted_by_inode(fd)) {
-        return true;
-    }
-    
-    // 次之使用路径匹配
-    return is_target_dwg_file(path);
 }
 
 /**
@@ -406,15 +353,6 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
 
         if (is_target_dwg_file(pathname)) {
             DEBUG_LOG("[跟踪] openat: fd=%d -> '%s' (目标DWG)", fd, pathname);
-            
-            // 新创建文件写入魔数
-            if ((flags & O_CREAT) && (flags & O_WRONLY)) {
-                unsigned int magic = MAGIC_HEADER;
-                ssize_t written = pwrite(fd, &magic, 4, 0);
-                if (written == 4) {
-                    DEBUG_LOG("已写入魔数到新文件: %s", pathname);
-                }
-            }
         } else {
             DEBUG_LOG("openat: fd=%d -> '%s' (非目标)", fd, pathname);
         }
@@ -460,14 +398,6 @@ int open(const char *pathname, int flags, ...) {
 
         if (is_target_dwg_file(pathname)) {
             DEBUG_LOG("[跟踪] open: fd=%d -> '%s' (目标DWG)", fd, pathname);
-            
-            if ((flags & O_CREAT) && (flags & O_WRONLY)) {
-                unsigned int magic = MAGIC_HEADER;
-                ssize_t written = pwrite(fd, &magic, 4, 0);
-                if (written == 4) {
-                    DEBUG_LOG("已写入魔数到新文件: %s", pathname);
-                }
-            }
         } else {
             DEBUG_LOG("open: fd=%d -> '%s' (非目标)", fd, pathname);
         }
@@ -496,13 +426,16 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
 
     char path_buf[PATH_MAX];
     const char *path = get_fd_path(fd, path_buf, sizeof(path_buf));
-
+    
+    // 仅使用路径匹配判断是否需要处理
+    int is_target = path && is_target_dwg_file(path);
+    
     DEBUG_LOG("pread64(fd=%d, 偏移=%ld, 大小=%zu, 返回值=%zd, 路径=%s)%s",
               fd, (long)offset, count, ret,
               path ? path : "(未知)",
-              needs_crypto_processing(fd, path) ? " [已解密]" : "");
+              is_target ? " [已解密]" : "");
 
-    if (needs_crypto_processing(fd, path)) {
+    if (is_target) {
         DEBUG_LOG("需要解密的文件: %s", path);
         unsigned char *data = (unsigned char *)buf;
 
@@ -540,13 +473,16 @@ ssize_t read(int fd, void *buf, size_t count) {
 
     char path_buf[PATH_MAX];
     const char *path = get_fd_path(fd, path_buf, sizeof(path_buf));
+    
+    // 仅使用路径匹配判断是否需要处理
+    int is_target = path && is_target_dwg_file(path);
 
     DEBUG_LOG("read(fd=%d, 大小=%zu, 返回值=%zd, 路径=%s)%s",
               fd, count, ret,
               path ? path : "(未知)",
-              needs_crypto_processing(fd, path) ? " [已解密]" : "");
+              is_target ? " [已解密]" : "");
 
-    if (needs_crypto_processing(fd, path)) {
+    if (is_target) {
         DEBUG_LOG("需要解密的文件: %s", path);
         unsigned char *data = (unsigned char *)buf;
 
@@ -582,6 +518,9 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     if (fd >= 0) {
         path = get_fd_path(fd, path_buf, sizeof(path_buf));
     }
+    
+    // 仅使用路径匹配判断是否需要处理
+    int is_target = path && is_target_dwg_file(path);
 
     DEBUG_LOG("mmap: 地址=%p, 长度=%zu, 权限=0x%x, 标志=0x%x, fd=%d, 偏移=%ld, 路径=%s",
               addr, length, prot, flags, fd, (long)offset, path ? path : "(无fd)");
@@ -592,23 +531,19 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         return ptr;
     }
 
-    int should_decrypt = 0;
-    if (fd >= 0 && path && needs_crypto_processing(fd, path)) {
-        should_decrypt = 1;
+    if (is_target) {
         DEBUG_LOG("[内存映射] 目标文件映射: fd=%d, 路径=%s, 区域=%p+%zu", fd, path, ptr, length);
-    } else {
-        DEBUG_LOG("mmap: 此映射无需解密 (fd=%d)", fd);
-    }
-
-    if (should_decrypt) {
+        
         if (safe_decrypt_mmap_region(ptr, length) == 0) {
             DEBUG_LOG("[内存映射解密] 成功解密映射区域: %p+%zu", ptr, length);
         } else {
             DEBUG_LOG("[内存映射解密] 解密映射区域失败: %p+%zu", ptr, length);
         }
+    } else {
+        DEBUG_LOG("mmap: 此映射无需解密 (fd=%d)", fd);
     }
 
-    track_mmap_region(ptr, length, should_decrypt, prot, flags, fd, offset);
+    track_mmap_region(ptr, length, is_target, prot, flags, fd, offset);
 
     return ptr;
 }
@@ -627,6 +562,9 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t off
     if (fd >= 0) {
         path = get_fd_path(fd, path_buf, sizeof(path_buf));
     }
+    
+    // 仅使用路径匹配判断是否需要处理
+    int is_target = path && is_target_dwg_file(path);
 
     DEBUG_LOG("mmap64: 地址=%p, 长度=%zu, 权限=0x%x, 标志=0x%x, fd=%d, 偏移=%lld, 路径=%s",
               addr, length, prot, flags, fd, (long long)offset, path ? path : "(无fd)");
@@ -637,23 +575,19 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t off
         return ptr;
     }
 
-    int should_decrypt = 0;
-    if (fd >= 0 && path && needs_crypto_processing(fd, path)) {
-        should_decrypt = 1;
+    if (is_target) {
         DEBUG_LOG("[内存映射64] 目标文件映射: fd=%d, 路径=%s, 区域=%p+%zu", fd, path, ptr, length);
-    } else {
-        DEBUG_LOG("mmap64: 此映射无需解密 (fd=%d)", fd);
-    }
-
-    if (should_decrypt) {
+        
         if (safe_decrypt_mmap_region(ptr, length) == 0) {
             DEBUG_LOG("[内存映射解密] 成功解密映射区域 (mmap64): %p+%zu", ptr, length);
         } else {
             DEBUG_LOG("[内存映射解密] 解密映射区域失败 (mmap64): %p+%zu", ptr, length);
         }
+    } else {
+        DEBUG_LOG("mmap64: 此映射无需解密 (fd=%d)", fd);
     }
 
-    track_mmap_region(ptr, length, should_decrypt, prot, flags, fd, offset);
+    track_mmap_region(ptr, length, is_target, prot, flags, fd, offset);
 
     return ptr;
 }
@@ -702,7 +636,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
     char path_buf[PATH_MAX] = {0};
     const char *path = get_fd_path(fd, path_buf, sizeof(path_buf));
-    int is_target = path && needs_crypto_processing(fd, path);
+    
+    // 仅使用路径匹配判断是否需要处理
+    int is_target = path && is_target_dwg_file(path);
     
     DEBUG_LOG("write(fd=%d, 大小=%zu, 路径=%s, 目标文件=%d)",
               fd, count, path ? path : "(未知)", is_target);
@@ -745,7 +681,9 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
 
     char path_buf[PATH_MAX] = {0};
     const char *path = get_fd_path(fd, path_buf, sizeof(path_buf));
-    int is_target = path && needs_crypto_processing(fd, path);
+    
+    // 仅使用路径匹配判断是否需要处理
+    int is_target = path && is_target_dwg_file(path);
     
     DEBUG_LOG("pwrite64(fd=%d, 偏移=%ld, 大小=%zu, 路径=%s, 目标文件=%d)",
               fd, (long)offset, count, path ? path : "(未知)", is_target);
@@ -827,45 +765,6 @@ int mprotect(void *addr, size_t len, int prot) {
     }
     
     return real_mprotect(addr, len, prot);
-}
-
-/**
- * 拦截 rename 系统调用
- */
-int rename(const char *oldpath, const char *newpath) {
-    static int (*real_rename)(const char *, const char *) = NULL;
-    if (!real_rename)
-        real_rename = dlsym(RTLD_NEXT, "rename");
-    
-    DEBUG_LOG("重命名: 原路径='%s', 新路径='%s'", oldpath, newpath);
-    
-    // 检查源文件是否加密
-    int src_fd = open(oldpath, O_RDONLY);
-    bool is_encrypted = false;
-    if (src_fd >= 0) {
-        is_encrypted = is_encrypted_by_inode(src_fd);
-        close(src_fd);
-    }
-    
-    int ret = real_rename(oldpath, newpath);
-    
-    // 更新缓存
-    if (ret == 0 && is_encrypted) {
-        struct stat file_stat;
-        if (stat(newpath, &file_stat) == 0) {
-            pthread_mutex_lock(&inode_mutex);
-            for (int i = 0; i < INODE_CACHE_SIZE; i++) {
-                if (inode_cache[i].inode == file_stat.st_ino) {
-                    DEBUG_LOG("更新inode缓存: inode=%lu, 新路径=%s", 
-                             file_stat.st_ino, newpath);
-                    break;
-                }
-            }
-            pthread_mutex_unlock(&inode_mutex);
-        }
-    }
-    
-    return ret;
 }
 
 /**
