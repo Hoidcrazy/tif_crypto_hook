@@ -42,6 +42,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <stdbool.h>   // 布尔类型支持
+#include <stdint.h>
 
 // ==================== 配置与全局变量 ====================
 
@@ -255,22 +256,115 @@ static void untrack_mmap_region(void *addr) {
     pthread_mutex_unlock(&mmap_mutex);
 }
 
-/**
- * 安全内存解密
- */
+// 修改后的内存权限查询函数
+static int get_memory_protection(void *addr) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        DEBUG_LOG("[内存权限] 无法打开/proc/self/maps");
+        return PROT_NONE;
+    }
+    
+    int protection = PROT_NONE;
+    char line[256];
+    unsigned long start, end;
+    uintptr_t addr_val = (uintptr_t)addr;  // 转换为整数类型便于比较
+    
+    while (fgets(line, sizeof(line), maps)) {
+        char perms[5] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
+            if (start <= addr_val && addr_val < end) {
+                protection = 0;
+                if (perms[0] == 'r') protection |= PROT_READ;
+                if (perms[1] == 'w') protection |= PROT_WRITE;
+                if (perms[2] == 'x') protection |= PROT_EXEC;
+                break;
+            }
+        }
+    }
+    
+    fclose(maps);
+    DEBUG_LOG("[内存权限] 地址 %p 权限: %c%c%c (0x%x)", 
+             addr,
+             (protection & PROT_READ) ? 'r' : '-',
+             (protection & PROT_WRITE) ? 'w' : '-',
+             (protection & PROT_EXEC) ? 'x' : '-',
+             protection);
+    
+    return protection;
+}
+
+// 修改后的安全内存解密函数
 static int safe_decrypt_mmap_region(void *addr, size_t length) {
     if (!addr || length == 0) {
         DEBUG_LOG("[内存解密] 无效地址或长度");
         return -1;
     }
 
+    // 获取当前内存保护属性
+    int orig_prot = get_memory_protection(addr);
+    
+    // 只读内存特殊处理 - 使用新映射替换原映射
+    if ((orig_prot & PROT_WRITE) == 0) {
+        DEBUG_LOG("[内存解密] 只读内存区域，创建新映射进行解密");
+        
+        // 1. 创建新的可读写匿名映射
+        void *new_map = mmap(NULL, length, PROT_READ | PROT_WRITE, 
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (new_map == MAP_FAILED) {
+            DEBUG_LOG("[内存解密] 匿名映射创建失败: %s", strerror(errno));
+            return -1;
+        }
+        
+        // 2. 复制数据到新映射
+        memcpy(new_map, addr, length);
+        
+        // 3. 解密新映射区域
+        unsigned char *data = (unsigned char *)new_map;
+        for (size_t i = 0; i < length; ++i) {
+            data[i] ^= 0xFF;
+        }
+        
+        // 4. 解除原只读映射
+        if (munmap(addr, length)) {
+            DEBUG_LOG("[内存解密] 解除原映射失败: %s", strerror(errno));
+            munmap(new_map, length);
+            return -1;
+        }
+        
+        // 5. 重新映射到原地址
+        void *remap = mmap(addr, length, PROT_READ | PROT_WRITE, 
+                          MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+        if (remap != addr) {
+            DEBUG_LOG("[内存解密] 重新映射失败: 期望=%p, 实际=%p", addr, remap);
+            munmap(new_map, length);
+            return -1;
+        }
+        
+        // 6. 复制解密数据回原地址
+        memcpy(addr, new_map, length);
+        munmap(new_map, length);
+        
+        // 7. 恢复原始保护属性
+        if (mprotect(addr, length, orig_prot)) {
+            DEBUG_LOG("[内存解密] 恢复权限失败: %s", strerror(errno));
+        }
+        
+        DEBUG_LOG("[内存解密] 通过映射替换完成解密");
+        return 0;
+    }
+
+    // 常规可写内存处理
     if (mprotect(addr, length, PROT_READ | PROT_WRITE) != 0) {
-        DEBUG_LOG("[内存解密] mprotect失败: %s", strerror(errno));
+        DEBUG_LOG("[内存解密] mprotect失败: %s (原始权限:0x%x)", 
+                 strerror(errno), orig_prot);
         return -1;
     }
 
-    DEBUG_LOG("[内存解密] 权限修改成功: %p+%zu 可读写", addr, length);
 
+    DEBUG_LOG("[内存解密] 权限修改成功: %p+%zu 可读写 (原始权限:0x%x)", 
+             addr, length, orig_prot);
+
+    // 执行异或解密
     unsigned char *data = (unsigned char *)addr;
     for (size_t i = 0; i < length; ++i) {
         data[i] ^= 0xFF;
@@ -279,14 +373,16 @@ static int safe_decrypt_mmap_region(void *addr, size_t length) {
     DEBUG_LOG("[内存解密] 解密完成: %p+%zu (前3字节: %02x %02x %02x ...)",
               addr, length, data[0], data[1], data[2]);
 
-    if (mprotect(addr, length, PROT_READ) != 0) {
+    // 恢复原始保护属性
+    if (mprotect(addr, length, orig_prot) != 0) {
         DEBUG_LOG("[内存解密] 恢复权限失败: %s", strerror(errno));
     } else {
-        DEBUG_LOG("[内存解密] 权限恢复: %p+%zu -> 只读", addr, length);
+        DEBUG_LOG("[内存解密] 权限恢复: %p+%zu -> 0x%x", addr, length, orig_prot);
     }
 
     return 0;
 }
+
 
 /**
  * 安全内存加密
@@ -504,9 +600,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     return ret;
 }
 
-/**
- * 拦截 mmap 系统调用
- */
+// 修改mmap函数
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
     if (!real_mmap)
@@ -514,7 +608,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 
     char path_buf[PATH_MAX] = {0};
     const char *path = NULL;
-
+    
     if (fd >= 0) {
         path = get_fd_path(fd, path_buf, sizeof(path_buf));
     }
@@ -534,10 +628,9 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     if (is_target) {
         DEBUG_LOG("[内存映射] 目标文件映射: fd=%d, 路径=%s, 区域=%p+%zu", fd, path, ptr, length);
         
-        if (safe_decrypt_mmap_region(ptr, length) == 0) {
-            DEBUG_LOG("[内存映射解密] 成功解密映射区域: %p+%zu", ptr, length);
-        } else {
-            DEBUG_LOG("[内存映射解密] 解密映射区域失败: %p+%zu", ptr, length);
+        // 尝试解密，即使失败也继续
+        if (safe_decrypt_mmap_region(ptr, length) != 0) {
+            DEBUG_LOG("[警告] 内存映射解密失败，数据可能未解密");
         }
     } else {
         DEBUG_LOG("mmap: 此映射无需解密 (fd=%d)", fd);
@@ -548,9 +641,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     return ptr;
 }
 
-/**
- * 拦截 mmap64 系统调用
- */
+// 同样修改mmap64函数
 void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
     static void *(*real_mmap64)(void *, size_t, int, int, int, off64_t) = NULL;
     if (!real_mmap64)
@@ -578,10 +669,8 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t off
     if (is_target) {
         DEBUG_LOG("[内存映射64] 目标文件映射: fd=%d, 路径=%s, 区域=%p+%zu", fd, path, ptr, length);
         
-        if (safe_decrypt_mmap_region(ptr, length) == 0) {
-            DEBUG_LOG("[内存映射解密] 成功解密映射区域 (mmap64): %p+%zu", ptr, length);
-        } else {
-            DEBUG_LOG("[内存映射解密] 解密映射区域失败 (mmap64): %p+%zu", ptr, length);
+        if (safe_decrypt_mmap_region(ptr, length) != 0) {
+            DEBUG_LOG("[警告] 内存映射解密失败 (mmap64)，数据可能未解密");
         }
     } else {
         DEBUG_LOG("mmap64: 此映射无需解密 (fd=%d)", fd);
