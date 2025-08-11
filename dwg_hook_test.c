@@ -744,61 +744,61 @@ int munmap(void *addr, size_t length) {
     return ret;
 }
 
-// /**
-//  * write钩子函数
-//  */
-// ssize_t write(int fd, const void *buf, size_t count) {
-//     static ssize_t (*real_write)(int, const void *, size_t) = NULL;
-//     if (!real_write) real_write = dlsym(RTLD_NEXT, "write");
+/**
+ * write钩子函数
+ */
+ssize_t write(int fd, const void *buf, size_t count) {
+    static ssize_t (*real_write)(int, const void *, size_t) = NULL;
+    if (!real_write) real_write = dlsym(RTLD_NEXT, "write");
     
-//     DEBUG_LOG("调用write: fd=%d, 大小=%zu", fd, count);
+    DEBUG_LOG("调用write: fd=%d, 大小=%zu", fd, count);
     
-//     fd_context_t *ctx = get_fd_context(fd);
-//     if (!ctx || !ctx->is_target) {
-//         return real_write(fd, buf, count);
-//     }
+    fd_context_t *ctx = get_fd_context(fd);
+    if (!ctx || !ctx->is_target) {
+        return real_write(fd, buf, count);
+    }
     
-//     update_fd_context(ctx);
-//     DEBUG_LOG("写入目标文件, 执行加密");
+    update_fd_context(ctx);
+    DEBUG_LOG("写入目标文件, 执行加密");
     
-//     // 分配临时缓冲区用于加密
-//     void *encrypted_buf = malloc(count);
-//     if (!encrypted_buf) {
-//         DEBUG_LOG("内存分配失败");
-//         errno = ENOMEM;
-//         return -1;
-//     }
+    // 分配临时缓冲区用于加密
+    void *encrypted_buf = malloc(count);
+    if (!encrypted_buf) {
+        DEBUG_LOG("内存分配失败");
+        errno = ENOMEM;
+        return -1;
+    }
     
-//     // 加密数据
-//     memcpy(encrypted_buf, buf, count);
-//     unsigned char *data = (unsigned char *)encrypted_buf;
-//     for (size_t i = 0; i < count; i++) {
-//         data[i] ^= 0xFF;
-//     }
+    // 加密数据
+    memcpy(encrypted_buf, buf, count);
+    unsigned char *data = (unsigned char *)encrypted_buf;
+    for (size_t i = 0; i < count; i++) {
+        data[i] ^= 0xFF;
+    }
     
-//     // 写入加密后的数据
-//     ssize_t ret = real_write(fd, encrypted_buf, count);
-//     free(encrypted_buf);
+    // 写入加密后的数据
+    ssize_t ret = real_write(fd, encrypted_buf, count);
+    free(encrypted_buf);
     
-//     if (ret > 0) {
-//         DEBUG_LOG("写入成功: %zd字节", ret);
+    if (ret > 0) {
+        DEBUG_LOG("写入成功: %zd字节", ret);
         
-//         // 更新关联内存映射区域的磁盘状态
-//         pthread_mutex_lock(&mmap_mutex);
-//         for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-//             if (mmap_regions[i].fd == fd) {
-//                 mmap_regions[i].disk_encrypted = true;
-//                 DEBUG_LOG("标记区域为磁盘已加密: fd=%d, addr=%p", 
-//                          fd, mmap_regions[i].addr);
-//             }
-//         }
-//         pthread_mutex_unlock(&mmap_mutex);
-//     } else {
-//         DEBUG_LOG("写入失败: %s", strerror(errno));
-//     }
+        // 更新关联内存映射区域的磁盘状态
+        pthread_mutex_lock(&mmap_mutex);
+        for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+            if (mmap_regions[i].fd == fd) {
+                mmap_regions[i].disk_encrypted = true;
+                DEBUG_LOG("标记区域为磁盘已加密: fd=%d, addr=%p", 
+                         fd, mmap_regions[i].addr);
+            }
+        }
+        pthread_mutex_unlock(&mmap_mutex);
+    } else {
+        DEBUG_LOG("写入失败: %s", strerror(errno));
+    }
     
-//     return ret;
-// }
+    return ret;
+}
 
 // ==================== 初始化和清理 ====================
 
