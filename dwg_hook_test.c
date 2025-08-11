@@ -59,8 +59,12 @@
 
 // ==================== 数据结构定义 ====================
 
+// 前置声明
+typedef struct fd_context fd_context_t;
+typedef struct mmap_region mmap_region_t;
+
 // FD上下文结构：跟踪文件描述符相关信息
-typedef struct {
+struct fd_context {
     int fd;                     // 文件描述符
     char *path;                 // 文件完整路径
     ino_t inode;                // 文件inode号
@@ -68,11 +72,12 @@ typedef struct {
     bool is_target;             // 是否为目标DWG文件
     time_t last_verified;       // 最后验证时间戳
     int access_count;           // 访问计数器
-    struct fd_context *next;    // 哈希冲突链表指针
-} fd_context_t;
+    mmap_region_t *mmap_regions; // 关联的内存映射区域链表
+    fd_context_t *next;         // 哈希冲突链表指针
+};
 
 // 内存映射区域跟踪结构
-typedef struct {
+struct mmap_region {
     void *addr;                 // 映射起始地址
     size_t length;              // 映射长度
     int prot;                   // 内存保护权限
@@ -82,8 +87,8 @@ typedef struct {
     bool modified;              // 是否被修改过
     bool in_mem_encrypted;      // 内存中是否加密
     bool disk_encrypted;        // 磁盘上是否加密
-    struct mmap_region *next;   // 关联到同一fd的下一个区域
-} mmap_region_t;
+    mmap_region_t *next;        // 关联到同一fd的下一个区域
+};
 
 // 热点路径缓存项
 typedef struct {
@@ -100,6 +105,11 @@ static mmap_region_t mmap_regions[MAX_MMAP_REGIONS] = {0};    // 内存映射区
 static pthread_mutex_t mmap_mutex = PTHREAD_MUTEX_INITIALIZER; // 内存映射互斥锁
 static hot_path_cache_t hot_path_cache[HOT_PATH_CACHE_SIZE] = {0}; // 热点路径缓存
 static pthread_mutex_t hot_path_mutex = PTHREAD_MUTEX_INITIALIZER; // 缓存互斥锁
+
+// ==================== 辅助函数声明 ====================
+int is_target_dwg_file(const char *path);
+static int safe_decrypt_mmap_region(void *addr, size_t length);
+static int safe_encrypt_mmap_region(void *addr, size_t length);
 
 // ==================== FD上下文管理 ====================
 
@@ -138,6 +148,7 @@ static void init_fd_context(int fd, const char *path) {
     ctx->is_target = is_target_dwg_file(ctx->path);
     ctx->last_verified = time(NULL);
     ctx->access_count = 0;
+    ctx->mmap_regions = NULL;
     ctx->next = NULL;
 
     // 添加到哈希表
@@ -396,10 +407,10 @@ static void add_mmap_region(void *addr, size_t length, int prot, int flags,
     fd_context_t *ctx = get_fd_context(fd);
     if (ctx) {
         // 添加到FD关联的映射列表
-        mmap_region_t *current = (mmap_region_t *)ctx->next;
-        if (!current) {
-            ctx->next = (fd_context_t *)&mmap_regions[slot];
+        if (ctx->mmap_regions == NULL) {
+            ctx->mmap_regions = &mmap_regions[slot];
         } else {
+            mmap_region_t *current = ctx->mmap_regions;
             while (current->next) {
                 current = current->next;
             }
@@ -425,8 +436,8 @@ static void remove_mmap_region(void *addr) {
             // 从FD关联列表中移除
             fd_context_t *ctx = get_fd_context(mmap_regions[i].fd);
             if (ctx) {
-                mmap_region_t **prev = (mmap_region_t **)&ctx->next;
-                mmap_region_t *current = (mmap_region_t *)ctx->next;
+                mmap_region_t **prev = &ctx->mmap_regions;
+                mmap_region_t *current = ctx->mmap_regions;
                 
                 while (current) {
                     if (current == &mmap_regions[i]) {
