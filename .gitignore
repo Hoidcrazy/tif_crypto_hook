@@ -55,5 +55,5 @@ Makefile
 *.backup
 
 # 忽略素材文件夹
-/tif_tests
-/dwg_tests
+/tif_tests/*.tif
+/dwg_tests/*.dwg
