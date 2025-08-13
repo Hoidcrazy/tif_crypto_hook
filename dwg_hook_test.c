@@ -12,11 +12,6 @@
 //   设置环境变量开启调试日志: export DWG_HOOK_DEBUG=1
 //   重定向输出查看日志: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so /opt/apps/zwcad2025/ZWCADRUN.sh
 
-// 文件路径: /home/chane/tif_crypto_hook/dwg_hook_test.c
-
-// 编译命令:
-//   gcc -shared -fPIC -o libdwg_hook.so dwg_hook_test.c -ldl -lpthread
-
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
@@ -36,6 +31,8 @@
 #include <stdint.h>
 #include <time.h>
 #include <strings.h> // 用于strcasecmp
+#include <sys/uio.h> // 用于readv/writev
+#include <sys/sendfile.h> // 用于sendfile
 
 // ==================== 配置选项 ====================
 #define MAX_TRACKED_FD 1024        // 最大跟踪文件描述符数量
@@ -43,14 +40,34 @@
 #define HOT_PATH_CACHE_SIZE 32     // 热点路径缓存大小
 #define DEBUG_LOG_ENABLED 1         // 是否启用调试日志
 #define DECRYPT_THRESHOLD 10        // 解密访问阈值
+#define ENCRYPT_CHUNK (64*1024)    // 文件加密块大小(64KB)
 
-// ==================== 调试日志系统 ====================
+// // ==================== 调试日志系统 ====================
+// #define DEBUG_LOG(fmt, ...) \
+//     do { \
+//         if (DEBUG_LOG_ENABLED) { \
+//             FILE *logfp = fopen("/tmp/dwg_hook.log", "a"); \
+//             if (logfp) { \
+//                 fprintf(logfp, "[DWG透明加解密] %s:%d " fmt "\n", \
+//                         __func__, __LINE__, ##__VA_ARGS__); \
+//                 fclose(logfp); \
+//             } \
+//         } \
+//     } while (0)
+
+// ==================== 调试日志系统(增强) ====================
 #define DEBUG_LOG(fmt, ...) \
     do { \
         if (DEBUG_LOG_ENABLED) { \
             FILE *logfp = fopen("/tmp/dwg_hook.log", "a"); \
             if (logfp) { \
-                fprintf(logfp, "[DWG透明加密] %s:%d " fmt "\n", \
+                struct timespec ts; \
+                clock_gettime(CLOCK_REALTIME, &ts); \
+                struct tm tm_time; \
+                localtime_r(&ts.tv_sec, &tm_time); \
+                fprintf(logfp, "[DWG透明加密][%02d:%02d:%02d.%03ld] %s:%d " fmt "\n", \
+                        tm_time.tm_hour, tm_time.tm_min, tm_time.tm_sec, \
+                        ts.tv_nsec / 1000000, \
                         __func__, __LINE__, ##__VA_ARGS__); \
                 fclose(logfp); \
             } \
@@ -76,7 +93,7 @@ struct fd_context {
     fd_context_t *next;         // 哈希冲突链表指针
 };
 
-// 内存映射区域跟踪结构
+// 增强的内存映射区域跟踪结构
 struct mmap_region {
     void *addr;                 // 映射起始地址
     size_t length;              // 映射长度
@@ -110,8 +127,22 @@ static pthread_mutex_t hot_path_mutex = PTHREAD_MUTEX_INITIALIZER; // 缓存互�
 int is_target_dwg_file(const char *path);
 static int safe_decrypt_mmap_region(void *addr, size_t length);
 static int safe_encrypt_mmap_region(void *addr, size_t length);
+static void xor_encrypt_decrypt(unsigned char *data, size_t length);
+static int get_memory_protection(void *addr); // 新增：获取内存保护权限
+static mmap_region_t *find_mmap_region(void *addr); // 新增：查找映射区域
 
 // ==================== FD上下文管理 ====================
+
+/**
+ * 执行异或加解密操作（0xFF）
+ * @param data 数据缓冲区
+ * @param length 数据长度
+ */
+static void xor_encrypt_decrypt(unsigned char *data, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        data[i] ^= 0xFF;  // 异或加密或解密
+    }
+}
 
 /**
  * 初始化FD上下文
@@ -138,11 +169,23 @@ static void init_fd_context(int fd, const char *path) {
     }
     
     ctx->fd = fd;
-    ctx->path = realpath(path, NULL); // 获取绝对路径
-    if (!ctx->path) {
-        ctx->path = strdup(path); // 回退到原始路径
-        DEBUG_LOG("realpath失败, 使用原始路径: %s", path);
+
+    // ctx->path = realpath(path, NULL); // 获取绝对路径
+    // if (!ctx->path) {
+    //     ctx->path = strdup(path); // 回退到原始路径
+    //     DEBUG_LOG("realpath失败, 使用原始路径: %s", path);
+    // }
+
+    // +++ 增强：详细记录路径处理过程 +++
+    char *resolved_path = realpath(path, NULL);
+    if (resolved_path) {
+        ctx->path = resolved_path;
+        DEBUG_LOG("路径解析成功: 原始路径=%s -> 绝对路径=%s", path, ctx->path);
+    } else {
+        ctx->path = strdup(path);
+        DEBUG_LOG("路径解析失败, 使用原始路径: %s (错误: %s)", path, strerror(errno));
     }
+
     ctx->inode = st.st_ino;
     ctx->device = st.st_dev;
     ctx->is_target = is_target_dwg_file(ctx->path);
@@ -168,8 +211,15 @@ static void init_fd_context(int fd, const char *path) {
     
     pthread_rwlock_unlock(&fd_table_lock);
     
-    DEBUG_LOG("FD上下文初始化: fd=%d, 路径=%s, inode=%lu, 目标文件=%d", 
-             fd, ctx->path, ctx->inode, ctx->is_target);
+    // +++ 增强：明确记录目标文件状态 +++
+    if (ctx->is_target) {
+        DEBUG_LOG("目标DWG文件已跟踪: fd=%d, 路径=%s", fd, ctx->path);
+    } else {
+        DEBUG_LOG("文件已跟踪: fd=%d, 路径=%s", fd, ctx->path);
+    }
+
+    // DEBUG_LOG("FD上下文初始化: fd=%d, 路径=%s, inode=%lu, 目标文件=%d", 
+    //          fd, ctx->path, ctx->inode, ctx->is_target);
 }
 
 /**
@@ -402,7 +452,7 @@ static void add_mmap_region(void *addr, size_t length, int prot, int flags,
     mmap_regions[slot].in_mem_encrypted = !is_target; // 非目标文件视为已加密
     mmap_regions[slot].disk_encrypted = !is_target;
     mmap_regions[slot].next = NULL;
-    
+
     // 关联到FD上下文
     fd_context_t *ctx = get_fd_context(fd);
     if (ctx) {
@@ -459,12 +509,116 @@ static void remove_mmap_region(void *addr) {
     pthread_mutex_unlock(&mmap_mutex);
 }
 
-// ==================== 辅助函数 ====================
+// ==================== 新增辅助函数 ====================
 
 /**
- * 判断是否为需要处理的目标DWG文件
- * @param path 文件路径
- * @return 1是目标文件，0不是
+ * 查找内存映射区域
+ * @param addr 内存地址
+ * @return 映射区域指针或NULL
+ */
+static mmap_region_t *find_mmap_region(void *addr) {
+    pthread_mutex_lock(&mmap_mutex);
+    mmap_region_t *result = NULL;
+    
+    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+        if (mmap_regions[i].addr == NULL) continue;
+        
+        void *reg_start = mmap_regions[i].addr;
+        void *reg_end = (char*)reg_start + mmap_regions[i].length;
+        
+        if (addr >= reg_start && addr < reg_end) {
+            result = &mmap_regions[i];
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&mmap_mutex);
+    return result;
+}
+
+/**
+ * 获取内存保护权限
+ * @param addr 内存地址
+ * @return 保护权限标志
+ */
+static int get_memory_protection(void *addr) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        DEBUG_LOG("[内存权限] 无法打开/proc/self/maps");
+        return PROT_NONE;
+    }
+    
+    int protection = PROT_NONE;
+    char line[256];
+    unsigned long start, end;
+    uintptr_t addr_val = (uintptr_t)addr;  // 转换为整数类型便于比较
+    
+    while (fgets(line, sizeof(line), maps)) {
+        char perms[5] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
+            if (start <= addr_val && addr_val < end) {
+                protection = 0;
+                if (perms[0] == 'r') protection |= PROT_READ;
+                if (perms[1] == 'w') protection |= PROT_WRITE;
+                if (perms[2] == 'x') protection |= PROT_EXEC;
+                break;
+            }
+        }
+    }
+    
+    fclose(maps);
+    DEBUG_LOG("[内存权限] 地址 %p 权限: %c%c%c (0x%x)", 
+             addr,
+             (protection & PROT_READ) ? 'r' : '-',
+             (protection & PROT_WRITE) ? 'w' : '-',
+             (protection & PROT_EXEC) ? 'x' : '-',
+             protection);
+    
+    return protection;
+}
+
+// ==================== 加解密核心函数 ====================
+
+// /**
+//  * 判断是否为需要处理的目标DWG文件
+//  * @param path 文件路径
+//  * @return 1是目标文件，0不是
+//  */
+// int is_target_dwg_file(const char *path) {
+//     if (!path) {
+//         DEBUG_LOG("路径为空");
+//         return 0;
+//     }
+
+//     // +++ 增强：记录所有文件访问尝试 +++
+//     DEBUG_LOG("文件路径检查: %s", path);
+
+//     size_t len = strlen(path);
+//     if (len < 4) {
+//         DEBUG_LOG("文件路径过短: %s", path);
+//         return 0;
+//     }
+    
+//     // 检查文件扩展名
+//     const char *ext = path + len - 4;
+//     if (strcasecmp(ext, ".dwg") != 0) {
+//         DEBUG_LOG("文件不是.dwg格式: %s", path);
+//         return 0;
+//     }
+
+//     // 检查路径中是否包含特定标识
+//     if (strstr(path, "changed_") == NULL) {
+//         DEBUG_LOG("文件路径不包含'changed_': %s", path);
+//         return 0;
+//     }
+
+//     // 在识别目标文件时输出路径
+//     DEBUG_LOG("目标DWG文件已识别: %s", path);
+//     return 1;
+// }
+
+/**
+ * 判断是否为需要处理的目标DWG文件（增强日志）
  */
 int is_target_dwg_file(const char *path) {
     if (!path) {
@@ -472,8 +626,9 @@ int is_target_dwg_file(const char *path) {
         return 0;
     }
 
-    DEBUG_LOG("检查文件路径: %s", path);
-
+    // +++ 增强：详细记录文件检查过程 +++
+    DEBUG_LOG("文件路径检查: %s", path);
+    
     size_t len = strlen(path);
     if (len < 4) {
         DEBUG_LOG("文件路径过短: %s", path);
@@ -482,13 +637,20 @@ int is_target_dwg_file(const char *path) {
     
     // 检查文件扩展名
     const char *ext = path + len - 4;
-    if (strcasecmp(ext, ".dwg") != 0) {
+    int is_dwg = (strcasecmp(ext, ".dwg") == 0);
+    
+    // 检查路径中是否包含特定标识
+    int has_changed = (strstr(path, "changed_") != NULL);
+    
+    DEBUG_LOG("文件属性: DWG格式=%s, 包含changed_=%s", 
+             is_dwg ? "是" : "否", has_changed ? "是" : "否");
+    
+    if (!is_dwg) {
         DEBUG_LOG("文件不是.dwg格式: %s", path);
         return 0;
     }
 
-    // 检查路径中是否包含特定标识
-    if (strstr(path, "changed_") == NULL) {
+    if (!has_changed) {
         DEBUG_LOG("文件路径不包含'changed_': %s", path);
         return 0;
     }
@@ -498,7 +660,7 @@ int is_target_dwg_file(const char *path) {
 }
 
 /**
- * 安全解密内存映射区域
+ * 安全解密内存映射区域（增强版，支持只读映射）
  * @param addr 起始地址
  * @param length 长度
  * @return 0成功，-1失败
@@ -509,23 +671,81 @@ static int safe_decrypt_mmap_region(void *addr, size_t length) {
         return -1;
     }
 
-    // 临时修改内存权限为可写
+    // 获取当前内存保护属性
+    int orig_prot = get_memory_protection(addr);
+    
+    // 只读内存特殊处理 - 使用新映射替换原映射
+    if ((orig_prot & PROT_WRITE) == 0) {
+        DEBUG_LOG("[内存解密] 只读内存区域，创建新映射进行解密");
+        
+        // 1. 创建新的可读写匿名映射
+        void *new_map = mmap(NULL, length, PROT_READ | PROT_WRITE, 
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (new_map == MAP_FAILED) {
+            DEBUG_LOG("[内存解密] 匿名映射创建失败: %s", strerror(errno));
+            return -1;
+        }
+        
+        // 2. 复制数据到新映射
+        memcpy(new_map, addr, length);
+        
+        // 3. 解密新映射区域
+        unsigned char *data = (unsigned char *)new_map;
+        xor_encrypt_decrypt(data, length);
+        
+        // 4. 解除原只读映射
+        if (munmap(addr, length)) {
+            DEBUG_LOG("[内存解密] 解除原映射失败: %s", strerror(errno));
+            munmap(new_map, length);
+            return -1;
+        }
+        
+        // 5. 重新映射到原地址
+        void *remap = mmap(addr, length, PROT_READ | PROT_WRITE, 
+                          MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+        if (remap != addr) {
+            DEBUG_LOG("[内存解密] 重新映射失败: 期望=%p, 实际=%p", addr, remap);
+            munmap(new_map, length);
+            return -1;
+        }
+        
+        // 6. 复制解密数据回原地址
+        memcpy(addr, new_map, length);
+        munmap(new_map, length);
+        
+        // 7. 恢复原始保护属性
+        if (mprotect(addr, length, orig_prot)) {
+            DEBUG_LOG("[内存解密] 恢复权限失败: %s", strerror(errno));
+        }
+        
+        DEBUG_LOG("[内存解密] 通过映射替换完成解密");
+        return 0;
+    }
+
+    // 常规可写内存处理
     if (mprotect(addr, length, PROT_READ | PROT_WRITE) != 0) {
-        DEBUG_LOG("mprotect失败: %s", strerror(errno));
+        DEBUG_LOG("[内存解密] mprotect失败: %s (原始权限:0x%x)", 
+                 strerror(errno), orig_prot);
         return -1;
     }
 
+    DEBUG_LOG("[内存解密] 权限修改成功: %p+%zu 可读写 (原始权限:0x%x)", 
+             addr, length, orig_prot);
+
     // 执行异或解密
     unsigned char *data = (unsigned char *)addr;
-    for (size_t i = 0; i < length; ++i) {
-        data[i] ^= 0xFF;
-    }
+    xor_encrypt_decrypt(data, length);
 
-    DEBUG_LOG("内存解密完成: %p+%zu (前3字节: %02x %02x %02x)",
+    DEBUG_LOG("[内存解密] 解密完成: %p+%zu (前3字节: %02x %02x %02x)",
               addr, length, data[0], data[1], data[2]);
 
-    // 恢复原始权限（简化处理，实际需要记录原始权限）
-    mprotect(addr, length, PROT_READ);
+    // 恢复原始保护属性
+    if (mprotect(addr, length, orig_prot) != 0) {
+        DEBUG_LOG("[内存解密] 恢复权限失败: %s", strerror(errno));
+    } else {
+        DEBUG_LOG("[内存解密] 权限恢复: %p+%zu -> 0x%x", addr, length, orig_prot);
+    }
+
     return 0;
 }
 
@@ -537,27 +757,100 @@ static int safe_decrypt_mmap_region(void *addr, size_t length) {
  */
 static int safe_encrypt_mmap_region(void *addr, size_t length) {
     if (!addr || length == 0) {
-        DEBUG_LOG("无效参数");
+        DEBUG_LOG("[内存加密] 无效地址或长度");
         return -1;
     }
 
+    // 获取当前内存保护属性
+    int orig_prot = get_memory_protection(addr);
+    
     // 临时修改内存权限为可写
     if (mprotect(addr, length, PROT_READ | PROT_WRITE) != 0) {
-        DEBUG_LOG("mprotect失败: %s", strerror(errno));
+        DEBUG_LOG("[内存加密] mprotect失败: %s", strerror(errno));
         return -1;
     }
 
     // 执行异或加密
     unsigned char *data = (unsigned char *)addr;
-    for (size_t i = 0; i < length; ++i) {
-        data[i] ^= 0xFF;
-    }
+    xor_encrypt_decrypt(data, length);
 
-    DEBUG_LOG("内存加密完成: %p+%zu (前3字节: %02x %02x %02x)",
+    DEBUG_LOG("[内存加密] 加密完成: %p+%zu (前3字节: %02x %02x %02x)",
               addr, length, data[0], data[1], data[2]);
 
     // 恢复原始权限
-    mprotect(addr, length, PROT_READ);
+    if (mprotect(addr, length, orig_prot) != 0) {
+        DEBUG_LOG("[内存加密] 恢复权限失败: %s", strerror(errno));
+    }
+
+    // 更新 region 状态
+    pthread_mutex_lock(&mmap_mutex);
+    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+        if (mmap_regions[i].addr == addr) {
+            mmap_regions[i].in_mem_encrypted = true;
+            mmap_regions[i].disk_encrypted = true;
+            mmap_regions[i].modified = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mmap_mutex);
+    
+    DEBUG_LOG("[内存加密] 更新状态: 地址=%p, 长度=%zu, in_mem_encrypted=true", addr, length);
+
+    return 0;
+}
+
+/**
+ * 文件加密函数（用于重命名后加密）
+ * @param path 文件路径
+ * @return 0成功，-1失败
+ */
+static int encrypt_file_on_disk(const char *path) {
+    if (!path) return -1;
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        DEBUG_LOG("encrypt_file_on_disk: 打开失败 %s: %s", path, strerror(errno));
+        return -1;
+    }
+
+    // 获取文件长度
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size == (off_t)-1) {
+        DEBUG_LOG("encrypt_file_on_disk: lseek失败 %s: %s", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    // 分块读取->异或->写回（使用 pwrite）
+    unsigned char *buf = malloc(ENCRYPT_CHUNK);
+    if (!buf) {
+        DEBUG_LOG("encrypt_file_on_disk: 内存分配失败");
+        close(fd);
+        return -1;
+    }
+
+    off_t off = 0;
+    while (off < size) {
+        size_t toread = (size - off) > ENCRYPT_CHUNK ? ENCRYPT_CHUNK : (size - off);
+        ssize_t n = pread(fd, buf, toread, off);
+        if (n <= 0) {
+            DEBUG_LOG("encrypt_file_on_disk: pread 失败 off=%ld %s", (long)off, strerror(errno));
+            break;
+        }
+        xor_encrypt_decrypt(buf, n); // 加密数据
+        ssize_t w = pwrite(fd, buf, n, off);
+        if (w != n) {
+            DEBUG_LOG("encrypt_file_on_disk: pwrite 失败 off=%ld w=%zd err=%s", (long)off, w, strerror(errno));
+            break;
+        }
+        off += n;
+    }
+
+    free(buf);
+    // 确保写回磁盘
+    fsync(fd);
+    close(fd);
+
+    DEBUG_LOG("encrypt_file_on_disk: 完成对文件加密: %s (大小=%ld)", path, (long)size);
     return 0;
 }
 
@@ -578,20 +871,60 @@ int open(const char *pathname, int flags, ...) {
         va_end(args);
     }
     
-    DEBUG_LOG("调用open: 路径=%s, 标志=0x%x, 模式=0%o", 
+    // +++ 关键增强：详细记录所有打开尝试 +++
+    DEBUG_LOG("==========================================================");
+    DEBUG_LOG("文件打开尝试: %s (标志:0x%x, 模式:0%o)", 
              pathname ? pathname : "(null)", flags, mode);
     
     int fd = (flags & O_CREAT) ? 
         real_open(pathname, flags, mode) : 
         real_open(pathname, flags);
     
+    // if (fd >= 0) {
+    //     init_fd_context(fd, pathname);
+    //     add_hot_path(pathname, 0, 0);
+    //     DEBUG_LOG("文件打开成功: fd=%d, 路径=%s", fd, pathname);
+
+    //     // +++ 新增：检查并输出加密文件打开日志 +++
+    //     fd_context_t *ctx = get_fd_context(fd);
+    //     if (ctx && ctx->is_target) {
+    //         DEBUG_LOG("已成功打开加密DWG文件: %s ", ctx->path);
+    //     }
+    // } else {
+    //     DEBUG_LOG("文件打开失败: %s, 错误: %s", 
+    //              pathname ? pathname : "(null)", strerror(errno));
+        
+    //     // +++ 新增：即使打开失败，也检查是否目标文件 +++
+    //     if (pathname && is_target_dwg_file(pathname)) {
+    //         DEBUG_LOG("目标DWG文件打开失败: %s", pathname);
+    //     }
+    // }
+
     if (fd >= 0) {
-        init_fd_context(fd, pathname);
-        add_hot_path(pathname, 0, 0);
         DEBUG_LOG("文件打开成功: fd=%d", fd);
+        
+        if (pathname) {
+            init_fd_context(fd, pathname);
+            add_hot_path(pathname, 0, 0);
+            
+            // +++ 立即检查是否目标文件 +++
+            fd_context_t *ctx = get_fd_context(fd);
+            if (ctx && ctx->is_target) {
+                DEBUG_LOG("已打开加密DWG文件: %s", ctx->path);
+            }
+        } else {
+            DEBUG_LOG("警告: 成功打开文件但路径为空!");
+        }
     } else {
-        DEBUG_LOG("文件打开失败: %s", strerror(errno));
+        DEBUG_LOG("文件打开失败: 错误: %s", strerror(errno));
+        
+        // +++ 即使打开失败也尝试识别目标文件 +++
+        if (pathname && is_target_dwg_file(pathname)) {
+            DEBUG_LOG("目标DWG文件打开失败: %s", pathname);
+        }
     }
+    
+    DEBUG_LOG("==========================================================");
     
     return fd;
 }
@@ -611,44 +944,65 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
         va_end(args);
     }
     
-    DEBUG_LOG("调用openat: 目录fd=%d, 路径=%s, 标志=0x%x, 模式=0%o", 
+    // +++ 关键增强：详细记录所有打开尝试 +++
+    DEBUG_LOG("==========================================================");
+    DEBUG_LOG("文件打开尝试: 目录fd=%d, 路径=%s, 标志=0x%x, 模式=0%o", 
              dirfd, pathname ? pathname : "(null)", flags, mode);
     
     int fd = (flags & O_CREAT) ? 
         real_openat(dirfd, pathname, flags, mode) : 
         real_openat(dirfd, pathname, flags);
     
+    // if (fd >= 0) {
+    //     init_fd_context(fd, pathname);
+    //     add_hot_path(pathname, 0, 0);
+    //     DEBUG_LOG("文件打开成功: fd=%d, 路径=%s", fd, pathname);
+
+    //     // 检查是否为加密DWG文件
+    //     fd_context_t *ctx = get_fd_context(fd);
+    //     if (ctx && ctx->is_target) {
+    //         DEBUG_LOG("已成功打开加密DWG文件: %s ", ctx->path);
+    //     }
+    // } else {
+    //     DEBUG_LOG("文件打开失败: %s, 错误: %s", 
+    //              pathname ? pathname : "(null)", strerror(errno));
+        
+    //     // +++ 新增：即使打开失败，也检查是否目标文件 +++
+    //     if (pathname && is_target_dwg_file(pathname)) {
+    //         DEBUG_LOG("目标DWG文件打开失败: %s", pathname);
+    //     }
+    // }
+    
+
     if (fd >= 0) {
-        init_fd_context(fd, pathname);
-        add_hot_path(pathname, 0, 0);
         DEBUG_LOG("文件打开成功: fd=%d", fd);
+        
+        if (pathname) {
+            init_fd_context(fd, pathname);
+            add_hot_path(pathname, 0, 0);
+            
+            // +++ 立即检查是否目标文件 +++
+            fd_context_t *ctx = get_fd_context(fd);
+            if (ctx && ctx->is_target) {
+                DEBUG_LOG("已打开加密DWG文件: %s", ctx->path);
+            }
+        } else {
+            DEBUG_LOG("警告: 成功打开文件但路径为空!");
+        }
     } else {
-        DEBUG_LOG("文件打开失败: %s", strerror(errno));
+        DEBUG_LOG("文件打开失败: 错误: %s", strerror(errno));
+        
+        // +++ 即使打开失败也尝试识别目标文件 +++
+        if (pathname && is_target_dwg_file(pathname)) {
+            DEBUG_LOG("目标DWG文件打开失败: %s", pathname);
+        }
     }
     
+    DEBUG_LOG("==========================================================");
+
     return fd;
 }
 
-/**
- * close钩子函数
- */
-int close(int fd) {
-    static int (*real_close)(int) = NULL;
-    if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
-    
-    DEBUG_LOG("调用close: fd=%d", fd);
-    
-    release_fd_context(fd);
-    int ret = real_close(fd);
-    
-    if (ret == 0) {
-        DEBUG_LOG("文件关闭成功: fd=%d", fd);
-    } else {
-        DEBUG_LOG("文件关闭失败: %s", strerror(errno));
-    }
-    
-    return ret;
-}
 
 /**
  * read钩子函数
@@ -657,59 +1011,90 @@ ssize_t read(int fd, void *buf, size_t count) {
     static ssize_t (*real_read)(int, void *, size_t) = NULL;
     if (!real_read) real_read = dlsym(RTLD_NEXT, "read");
     
-    DEBUG_LOG("调用read: fd=%d, 大小=%zu", fd, count);
-    
+    // 获取上下文
+    fd_context_t *ctx = get_fd_context(fd);
+
+    // +++ 增强：记录所有读取操作 +++
+    const char *path = ctx ? ctx->path : "(未知)";
+    DEBUG_LOG("读取操作: fd=%d, 路径=%s, 大小=%zu", fd, path, count);
+
     ssize_t ret = real_read(fd, buf, count);
     if (ret <= 0) {
         DEBUG_LOG("读取失败或结束: ret=%zd", ret);
         return ret;
     }
     
-    // 获取上下文并检查是否为需要处理的文件
-    fd_context_t *ctx = get_fd_context(fd);
+    // 检查是否为需要处理的文件
     if (ctx && ctx->is_target) {
         update_fd_context(ctx);
         
-        DEBUG_LOG("解密目标文件数据: fd=%d, 大小=%zd", fd, ret);
+        DEBUG_LOG("解密目标文件数据: %s, 大小=%zd", ctx->path, ret);
         
         // 执行解密操作
         unsigned char *data = (unsigned char *)buf;
-        for (ssize_t i = 0; i < ret; ++i) {
-            data[i] ^= 0xFF;
-        }
+        xor_encrypt_decrypt(data, ret);  // 解密数据
         
         DEBUG_LOG("解密完成: 前3字节: %02x %02x %02x", data[0], data[1], data[2]);
+    } else if (ctx) {
+        DEBUG_LOG("非目标文件读取: %s", ctx->path);
+    } else {
+        DEBUG_LOG("未跟踪文件读取: fd=%d", fd);
     }
     
     return ret;
 }
 
 /**
- * mmap钩子函数
+ * mmap钩子函数（增强版）
  */
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
     if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
     
-    DEBUG_LOG("调用mmap: 地址=%p, 长度=%zu, 权限=0x%x, 标志=0x%x, fd=%d, 偏移=%ld", 
-             addr, length, prot, flags, fd, (long)offset);
+    // 获取上下文
+    fd_context_t *ctx = get_fd_context(fd);
+
+    // +++ 增强：在映射前记录文件信息 +++
+    const char *path = ctx ? ctx->path : "(未知)";
+    DEBUG_LOG("映射操作: fd=%d, 路径=%s, 地址=%p, 长度=%zu", fd, path, addr, length);
     
     void *ptr = real_mmap(addr, length, prot, flags, fd, offset);
     if (ptr == MAP_FAILED) {
         DEBUG_LOG("mmap失败: %s", strerror(errno));
+
+        // +++ 增强：记录目标文件映射失败 +++
+        if (ctx && ctx->is_target) {
+            DEBUG_LOG("加密DWG文件映射失败: %s", ctx->path);
+        }
+
         return ptr;
     }
     
     // 检查是否为需要处理的文件
     bool is_target = false;
-    fd_context_t *ctx = get_fd_context(fd);
+    // fd_context_t *ctx = get_fd_context(fd);
     if (ctx) {
         update_fd_context(ctx);
         is_target = ctx->is_target;
         
         if (is_target) {
-            DEBUG_LOG("目标文件映射, 执行内存解密");
-            safe_decrypt_mmap_region(ptr, length);
+            DEBUG_LOG("目标文件映射: %s, 执行内存解密", ctx->path);
+            if (safe_decrypt_mmap_region(ptr, length) == 0) {
+                // 更新映射区域状态
+                pthread_mutex_lock(&mmap_mutex);
+                for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                    if (mmap_regions[i].addr == ptr) {
+                        mmap_regions[i].in_mem_encrypted = false;
+                        mmap_regions[i].disk_encrypted = true;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&mmap_mutex);
+            
+                DEBUG_LOG("内存解密成功: %s", ctx->path);
+            } else {
+                DEBUG_LOG("内存解密失败: %s", ctx->path);
+            }
         }
     }
     
@@ -720,7 +1105,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 }
 
 /**
- * munmap钩子函数
+ * munmap钩子函数（增强版）
  */
 int munmap(void *addr, size_t length) {
     static int (*real_munmap)(void *, size_t) = NULL;
@@ -729,20 +1114,19 @@ int munmap(void *addr, size_t length) {
     DEBUG_LOG("调用munmap: 地址=%p, 长度=%zu", addr, length);
     
     // 查找并处理关联区域
-    pthread_mutex_lock(&mmap_mutex);
-    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-        if (mmap_regions[i].addr == addr) {
-            // 如果文件被修改且未加密，执行加密
-            if (!mmap_regions[i].in_mem_encrypted && 
-                mmap_regions[i].modified && 
-                !mmap_regions[i].disk_encrypted) {
-                DEBUG_LOG("区域被修改, 执行内存加密");
-                safe_encrypt_mmap_region(addr, length);
+    mmap_region_t *region = find_mmap_region(addr);
+    
+    // 需要加密的情况：目标文件+已修改+磁盘未加密
+    if (region && region->in_mem_encrypted == false && 
+        region->modified && !region->disk_encrypted) {
+        DEBUG_LOG("区域被修改, 执行内存加密");
+        if (safe_encrypt_mmap_region(addr, length) == 0) {
+            // 同步到磁盘
+            if (region->fd >= 0) {
+                msync(addr, length, MS_SYNC);
             }
-            break;
         }
     }
-    pthread_mutex_unlock(&mmap_mutex);
     
     int ret = real_munmap(addr, length);
     if (ret == 0) {
@@ -756,16 +1140,19 @@ int munmap(void *addr, size_t length) {
 }
 
 /**
- * write钩子函数
+ * write钩子函数（增强版）
  */
 ssize_t write(int fd, const void *buf, size_t count) {
     static ssize_t (*real_write)(int, const void *, size_t) = NULL;
     if (!real_write) real_write = dlsym(RTLD_NEXT, "write");
     
-    DEBUG_LOG("调用write: fd=%d, 大小=%zu", fd, count);
-    
     fd_context_t *ctx = get_fd_context(fd);
-    if (!ctx || !ctx->is_target) {
+
+    // +++ 增强：在写入前记录文件信息 +++
+    const char *path = ctx ? ctx->path : "(未知)";
+    DEBUG_LOG("写入操作: fd=%d, 路径=%s, 大小=%zu", fd, path, count);
+
+    if (!ctx || !ctx->is_target || count == 0 || !buf) {
         return real_write(fd, buf, count);
     }
     
@@ -783,9 +1170,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
     // 加密数据
     memcpy(encrypted_buf, buf, count);
     unsigned char *data = (unsigned char *)encrypted_buf;
-    for (size_t i = 0; i < count; i++) {
-        data[i] ^= 0xFF;
-    }
+    xor_encrypt_decrypt(data, count);
     
     // 写入加密后的数据
     ssize_t ret = real_write(fd, encrypted_buf, count);
@@ -811,13 +1196,125 @@ ssize_t write(int fd, const void *buf, size_t count) {
     return ret;
 }
 
+/**
+ * msync钩子函数（新增）
+ */
+int msync(void *addr, size_t length, int flags) {
+    static int (*real_msync)(void *, size_t, int) = NULL;
+    if (!real_msync) real_msync = dlsym(RTLD_NEXT, "msync");
+    
+    DEBUG_LOG("调用msync: 地址=%p, 长度=%zu, 标志=0x%x", addr, length, flags);
+    
+    mmap_region_t *region = find_mmap_region(addr);
+    if (region && region->in_mem_encrypted == false && 
+        region->modified && !region->disk_encrypted) 
+    {
+        DEBUG_LOG("区域需要加密后同步");
+        // 加密内存区域
+        if (safe_encrypt_mmap_region(addr, length) == 0) {
+            // 执行真实msync
+            int ret = real_msync(addr, length, flags);
+            // 解密回内存
+            safe_decrypt_mmap_region(addr, length);
+            // 更新状态
+            region->modified = false;
+            return ret;
+        }
+    }
+    return real_msync(addr, length, flags);
+}
+
+/**
+ * mprotect钩子函数（新增）
+ */
+int mprotect(void *addr, size_t len, int prot) {
+    static int (*real_mprotect)(void *, size_t, int) = NULL;
+    if (!real_mprotect) real_mprotect = dlsym(RTLD_NEXT, "mprotect");
+    
+    DEBUG_LOG("调用mprotect: 地址=%p, 长度=%zu, 权限=0x%x", addr, len, prot);
+    
+    // 如果设置为可写，标记映射区域为已修改
+    if (prot & PROT_WRITE) {
+        mmap_region_t *region = find_mmap_region(addr);
+        if (region) {
+            region->modified = true;
+            region->disk_encrypted = false;
+            DEBUG_LOG("标记区域为可写: 地址=%p, 长度=%zu", addr, len);
+        }
+    }
+    
+    return real_mprotect(addr, len, prot);
+}
+
+/**
+ * rename钩子函数（新增）
+ */
+int rename(const char *oldpath, const char *newpath) {
+    static int (*real_rename)(const char *, const char *) = NULL;
+    if (!real_rename) real_rename = dlsym(RTLD_NEXT, "rename");
+
+    DEBUG_LOG("调用rename: %s -> %s", oldpath?oldpath:"(null)", newpath?newpath:"(null)");
+    int ret = real_rename(oldpath, newpath);
+
+    if (ret == 0 && newpath && is_target_dwg_file(newpath)) {
+        // 新路径是目标 DWG，确保磁盘文件被加密
+        if (encrypt_file_on_disk(newpath) != 0) {
+            DEBUG_LOG("rename: 对 newpath 加密失败 %s", newpath);
+        }
+    }
+
+    return ret;
+}
+
+/**
+ * renameat钩子函数（新增）
+ */
+int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
+    static int (*real_renameat)(int, const char *, int, const char *) = NULL;
+    if (!real_renameat) real_renameat = dlsym(RTLD_NEXT, "renameat");
+
+    DEBUG_LOG("调用renameat: %d:%s -> %d:%s", 
+             olddirfd, oldpath?oldpath:"(null)", 
+             newdirfd, newpath?newpath:"(null)");
+    int ret = real_renameat(olddirfd, oldpath, newdirfd, newpath);
+
+    if (ret == 0 && newpath && is_target_dwg_file(newpath)) {
+        if (encrypt_file_on_disk(newpath) != 0) {
+            DEBUG_LOG("renameat: 对 newpath 加密失败 %s", newpath);
+        }
+    }
+
+    return ret;
+}
+
+/**
+ * close钩子函数
+ */
+int close(int fd) {
+    static int (*real_close)(int) = NULL;
+    if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
+    
+    DEBUG_LOG("调用close: fd=%d", fd);
+    
+    release_fd_context(fd);
+    int ret = real_close(fd);
+    
+    if (ret == 0) {
+        DEBUG_LOG("文件关闭成功: fd=%d", fd);
+    } else {
+        DEBUG_LOG("文件关闭失败: %s", strerror(errno));
+    }
+    
+    return ret;
+}
+
 // ==================== 初始化和清理 ====================
 
 /**
  * 库加载时执行的构造函数
  */
 __attribute__((constructor)) static void lib_init() {
-    DEBUG_LOG("DWG透明加密钩子库已加载");
+    DEBUG_LOG("DWG透明加解密钩子库已加载");
     
     // 初始化全局数据结构
     memset(fd_context_table, 0, sizeof(fd_context_table));
@@ -825,6 +1322,21 @@ __attribute__((constructor)) static void lib_init() {
     memset(hot_path_cache, 0, sizeof(hot_path_cache));
     
     DEBUG_LOG("全局数据结构初始化完成");
+
+    // +++ 增强：记录关键配置 +++
+    DEBUG_LOG("配置参数: MAX_TRACKED_FD=%d, MAX_MMAP_REGIONS=%d", 
+             MAX_TRACKED_FD, MAX_MMAP_REGIONS);
+    DEBUG_LOG("解密阈值: DECRYPT_THRESHOLD=%d, 加密块大小: ENCRYPT_CHUNK=%d", 
+             DECRYPT_THRESHOLD, ENCRYPT_CHUNK);
+    DEBUG_LOG("调试日志: %s", DEBUG_LOG_ENABLED ? "启用" : "禁用");
+
+     // +++ 增强：检查环境变量 +++
+     const char *debug_env = getenv("DWG_HOOK_DEBUG");
+     if (debug_env) {
+         DEBUG_LOG("环境变量 DWG_HOOK_DEBUG=%s", debug_env);
+     }
+     
+     DEBUG_LOG("全局数据结构初始化完成");
 }
 
 /**
@@ -834,19 +1346,25 @@ __attribute__((destructor)) static void lib_cleanup() {
     DEBUG_LOG("DWG透明加密钩子库卸载中...");
     
     // 清理所有FD上下文
+    int ctx_count = 0;
     pthread_rwlock_wrlock(&fd_table_lock);
     for (int i = 0; i < MAX_TRACKED_FD; i++) {
         fd_context_t *ctx = fd_context_table[i];
         while (ctx) {
             fd_context_t *next = ctx->next;
+
+            // +++ 增强：记录清理的上下文 +++
+            DEBUG_LOG("清理FD上下文: fd=%d, 路径=%s", ctx->fd, ctx->path);
+
             free(ctx->path);
             free(ctx);
             ctx = next;
+            ctx_count++;
         }
         fd_context_table[i] = NULL;
     }
     pthread_rwlock_unlock(&fd_table_lock);
     
-    DEBUG_LOG("FD上下文清理完成");
+    DEBUG_LOG("FD上下文清理完成: 共清理 %d 个上下文", ctx_count);
     DEBUG_LOG("库卸载完成");
 }
