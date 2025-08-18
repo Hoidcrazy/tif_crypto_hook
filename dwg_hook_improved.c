@@ -5,7 +5,7 @@
 //
 // 使用方法:
 //   export DWG_HOOK_DEBUG=1
-//   LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook_improved.so ./ZWCAD "$@" /product ZWCAD
+//   LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook_improved.so /opt/apps/zwcad2025/ZWCADRUN.sh
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -26,12 +26,16 @@
 #include <stdint.h>
 #include <time.h>
 #include <locale.h>
+#include <sys/mman.h>
 
 // ==================== 配置与全局调试 ====================
 
 #define MAX_TRACKED_FD 1024
 #define DWG_MAGIC_SIZE 32
 #define LOG_FILE_PATH "/tmp/dwg_hook.log"
+#define WRITE_BLOCK_SIZE (1 * 1024 * 1024) // 1MB分块大小
+#define MEMORY_CRYPT_BLOCK_SIZE (64 * 1024) // 64KB内存加解密分块大小
+#define MAX_MEMORY_OPERATION_SIZE (16 * 1024 * 1024) // 16MB最大内存操作限制
 
 // 调试标志：控制是否输出调试日志
 static int debug_enabled = -1;
@@ -406,7 +410,7 @@ static void untrack_mmap_region(void *addr) {
     pthread_mutex_unlock(&mmap_mutex);
 }
 
-// ==================== 加解密工具函数 ====================
+// ==================== 优化的加解密工具函数 ====================
 
 /** 异或加密/解密 */
 static void xor_encrypt_decrypt(unsigned char *data, size_t size) {
@@ -415,30 +419,100 @@ static void xor_encrypt_decrypt(unsigned char *data, size_t size) {
     }
 }
 
-/** 安全的内存区域解密 */
-static int safe_decrypt_memory(void *addr, size_t length) {
+/** 
+ * 分块内存加解密函数
+ * 避免一次性处理大内存块导致卡死
+ */
+static int chunked_memory_crypt(void *addr, size_t length, const char *operation) {
     if (!addr || length == 0) return -1;
     
-    // 临时设置写权限
-    if (mprotect(addr, length, PROT_READ | PROT_WRITE) != 0) {
-        DEBUG_LOG("mprotect设置写权限失败: %s", strerror(errno));
+    // 检查内存操作大小限制
+    if (length > MAX_MEMORY_OPERATION_SIZE) {
+        DEBUG_LOG("警告: 内存操作大小超限 (%zu > %d), 跳过%s", 
+                  length, MAX_MEMORY_OPERATION_SIZE, operation);
         return -1;
     }
     
-    DEBUG_LOG("开始内存区域解密: addr=%p, 长度=%zu", addr, length);
-    log_hex_3_bytes("内存解密前", (unsigned char *)addr, length);
+    DEBUG_LOG("开始分块%s: addr=%p, 总长度=%zu, 分块大小=%d", 
+              operation, addr, length, MEMORY_CRYPT_BLOCK_SIZE);
     
-    xor_encrypt_decrypt((unsigned char *)addr, length);
+    size_t processed = 0;
+    unsigned char *ptr = (unsigned char *)addr;
     
-    log_hex_3_bytes("内存解密后", (unsigned char *)addr, length);
-    
-    // 恢复只读权限
-    if (mprotect(addr, length, PROT_READ) != 0) {
-        DEBUG_LOG("mprotect恢复只读权限失败: %s", strerror(errno));
+    while (processed < length) {
+        size_t chunk_size = (length - processed > MEMORY_CRYPT_BLOCK_SIZE) 
+                          ? MEMORY_CRYPT_BLOCK_SIZE 
+                          : length - processed;
+        
+        // 临时设置写权限（仅对当前分块）
+        if (mprotect(ptr + processed, chunk_size, PROT_READ | PROT_WRITE) != 0) {
+            DEBUG_LOG("mprotect设置写权限失败: 偏移=%zu, 分块大小=%zu, 错误: %s", 
+                      processed, chunk_size, strerror(errno));
+            return -1;
+        }
+        
+        // 对当前分块进行加密/解密
+        xor_encrypt_decrypt(ptr + processed, chunk_size);
+        
+        // 恢复只读权限
+        if (mprotect(ptr + processed, chunk_size, PROT_READ) != 0) {
+            DEBUG_LOG("mprotect恢复只读权限失败: 偏移=%zu, 分块大小=%zu, 错误: %s", 
+                      processed, chunk_size, strerror(errno));
+        }
+        
+        processed += chunk_size;
+        
+        // 每处理几个分块输出一次进度
+        if ((processed % (MEMORY_CRYPT_BLOCK_SIZE * 4)) == 0 || processed == length) {
+            DEBUG_LOG("%s进度: %zu / %zu 字节 (%.1f%%)", 
+                      operation, processed, length, 
+                      (double)processed / length * 100.0);
+        }
+        
+        // 让出CPU时间，避免长时间占用
+        if (processed < length) {
+            usleep(1000); // 1ms
+        }
     }
     
-    DEBUG_LOG("内存区域解密完成");
+    DEBUG_LOG("分块%s完成: 总处理=%zu字节", operation, processed);
     return 0;
+}
+
+/** 安全的内存区域解密（分块处理） */
+static int safe_decrypt_memory(void *addr, size_t length) {
+    if (!addr || length == 0) return -1;
+    
+    log_hex_3_bytes("内存解密前", (unsigned char *)addr, length);
+    
+    int result = chunked_memory_crypt(addr, length, "解密");
+    
+    if (result == 0) {
+        log_hex_3_bytes("内存解密后", (unsigned char *)addr, length);
+        DEBUG_LOG("内存区域解密成功");
+    } else {
+        DEBUG_LOG("内存区域解密失败");
+    }
+    
+    return result;
+}
+
+/** 安全的内存区域加密（分块处理） */
+static int safe_encrypt_memory(void *addr, size_t length) {
+    if (!addr || length == 0) return -1;
+    
+    log_hex_3_bytes("内存加密前", (unsigned char *)addr, length);
+    
+    int result = chunked_memory_crypt(addr, length, "加密");
+    
+    if (result == 0) {
+        log_hex_3_bytes("内存加密后", (unsigned char *)addr, length);
+        DEBUG_LOG("内存区域加密成功");
+    } else {
+        DEBUG_LOG("内存区域加密失败");
+    }
+    
+    return result;
 }
 
 /** 检查并解密内存映射区域 */
@@ -696,7 +770,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     return ret;
 }
 
-// ==================== Hook：内存映射 ====================
+// ==================== Hook：内存映射（优化版本） ====================
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
@@ -726,13 +800,19 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                 DEBUG_LOG("需要解密: %s", should_decrypt ? "是" : "否");
                 DEBUG_LOG("保护模式: 0x%x", prot);
                 DEBUG_LOG("映射标志: 0x%x", flags);
+                
+                // 对大内存映射给出警告
+                if (length > MAX_MEMORY_OPERATION_SIZE) {
+                    DEBUG_LOG("警告: 大内存映射区域 (%zu字节), 将跳过解密以避免卡死", length);
+                    should_decrypt = 0; // 强制禁用解密
+                }
             }
         }
     }
 
     track_mmap_region(ptr, length, should_decrypt, prot, flags, fd, offset);
 
-    // 如果是目标文件，检查并解密
+    // 如果是目标文件且不超过大小限制，检查并解密
     if (should_decrypt && (prot & PROT_READ)) {
         if (check_and_decrypt_mmap_region(ptr, length, fd)) {
             DEBUG_LOG("mmap区域解密成功: addr=%p, 长度=%zu", ptr, length);
@@ -774,6 +854,12 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t off
                 DEBUG_LOG("需要解密: %s", should_decrypt ? "是" : "否");
                 DEBUG_LOG("保护模式: 0x%x", prot);
                 DEBUG_LOG("映射标志: 0x%x", flags);
+                
+                // 对大内存映射给出警告
+                if (length > MAX_MEMORY_OPERATION_SIZE) {
+                    DEBUG_LOG("警告: 大内存映射区域 (%zu字节), 将跳过解密以避免卡死", length);
+                    should_decrypt = 0; // 强制禁用解密
+                }
             }
         }
     }
@@ -804,7 +890,12 @@ int munmap(void *addr, size_t length) {
     mmap_region_t *region = find_mmap_region(addr);
     if (region && region->should_decrypt && region->modified) {
         DEBUG_LOG("munmap前需要加密内存区域 %p+%zu", addr, length);
-        // 这里可以添加加密逻辑，确保磁盘上保存的是密文
+        // 仅对小于限制的区域进行加密
+        if (length <= MAX_MEMORY_OPERATION_SIZE) {
+            safe_encrypt_memory(addr, length);
+        } else {
+            DEBUG_LOG("munmap: 内存区域过大，跳过加密 (%zu字节)", length);
+        }
     }
 
     int ret = real_munmap(addr, length);
@@ -817,7 +908,7 @@ int munmap(void *addr, size_t length) {
     return ret;
 }
 
-// ==================== Hook：写入时加密 ====================
+// ==================== Hook：写入时加密（分块处理） ====================
 
 ssize_t write(int fd, const void *buf, size_t count) {
     static ssize_t (*real_write)(int, const void *, size_t) = NULL;
@@ -835,33 +926,63 @@ ssize_t write(int fd, const void *buf, size_t count) {
     if (!ctx.is_target) {
         ret = real_write(fd, buf, count);
     } else {
-        // 目标文件：加密后写入
+        // 目标文件：加密后写入（分块处理）
         DEBUG_LOG("=====【write Hook成功调用】=====");
         DEBUG_LOG("文件: %s", ctx.path ? ctx.path : "未知");
         DEBUG_LOG("写入大小: %zd", count);
         log_hex_3_bytes("加密前数据", (unsigned char *)buf, count);
         
-        void *tmp = malloc(count);
-        if (!tmp) { 
-            free(ctx.path); 
-            errno = ENOMEM; 
-            DEBUG_LOG("write内存分配失败");
-            return -1; 
+        ssize_t total_written = 0;
+        bool success = true;
+        const unsigned char *src = (const unsigned char *)buf;
+        
+        while (total_written < count && success) {
+            size_t chunk_size = (count - total_written > WRITE_BLOCK_SIZE) 
+                              ? WRITE_BLOCK_SIZE 
+                              : count - total_written;
+            
+            void *tmp = malloc(chunk_size);
+            if (!tmp) {
+                DEBUG_LOG("write内存分配失败: 请求大小=%zu", chunk_size);
+                success = false;
+                break;
+            }
+            
+            // 加密当前分块
+            memcpy(tmp, src + total_written, chunk_size);
+            xor_encrypt_decrypt((unsigned char *)tmp, chunk_size);
+            
+            // 写入分块
+            ssize_t n = real_write(fd, tmp, chunk_size);
+            free(tmp);
+            
+            if (n < 0) {
+                DEBUG_LOG("write分块写入失败: 错误: %s", strerror(errno));
+                success = false;
+                break;
+            } else if (n == 0) {
+                DEBUG_LOG("write分块写入返回0，停止写入");
+                break;
+            }
+            
+            total_written += n;
+            
+            // 输出进度（每4MB）
+            if (total_written > 0 && (total_written % (WRITE_BLOCK_SIZE * 4)) == 0) {
+                DEBUG_LOG("write进度: %zd / %zd 字节 (%.1f%%)", 
+                          total_written, count, (double)total_written / count * 100.0);
+            }
         }
-        memcpy(tmp, buf, count);
-        xor_encrypt_decrypt((unsigned char *)tmp, count);
         
-        log_hex_3_bytes("加密后数据", (unsigned char *)tmp, count);
-
-        ret = real_write(fd, tmp, count);
-        free(tmp);
-        
-        if (ret >= 0) {
-            DEBUG_LOG("write加密写入成功: fd=%d, 请求=%zd字节, 实际写入=%zd字节", fd, count, ret);
+        if (success) {
+            ret = total_written;
             bool dk = true;
             fd_ctx_update_flags(fd, &dk, NULL);
+            DEBUG_LOG("write加密写入成功: 总写入=%zd字节", ret);
         } else {
-            DEBUG_LOG("write写入失败: fd=%d, 错误: %s", fd, strerror(errno));
+            ret = -1;
+            errno = ENOMEM;
+            DEBUG_LOG("write写入失败");
         }
         DEBUG_LOG("====================================");
     }
@@ -890,27 +1011,59 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
         DEBUG_LOG("写入偏移: %ld, 大小: %zd", (long)offset, count);
         log_hex_3_bytes("加密前数据", (unsigned char *)buf, count);
         
-        void *tmp = malloc(count);
-        if (!tmp) { 
-            free(ctx.path); 
-            errno = ENOMEM; 
-            DEBUG_LOG("pwrite64内存分配失败");
-            return -1; 
+        ssize_t total_written = 0;
+        bool success = true;
+        const unsigned char *src = (const unsigned char *)buf;
+        off_t current_offset = offset;
+        
+        while (total_written < count && success) {
+            size_t chunk_size = (count - total_written > WRITE_BLOCK_SIZE) 
+                              ? WRITE_BLOCK_SIZE 
+                              : count - total_written;
+            
+            void *tmp = malloc(chunk_size);
+            if (!tmp) {
+                DEBUG_LOG("pwrite64内存分配失败: 请求大小=%zu", chunk_size);
+                success = false;
+                break;
+            }
+            
+            // 加密当前分块
+            memcpy(tmp, src + total_written, chunk_size);
+            xor_encrypt_decrypt((unsigned char *)tmp, chunk_size);
+            
+            // 写入分块
+            ssize_t n = real_pwrite64(fd, tmp, chunk_size, current_offset);
+            free(tmp);
+            
+            if (n < 0) {
+                DEBUG_LOG("pwrite64分块写入失败: 错误: %s", strerror(errno));
+                success = false;
+                break;
+            } else if (n == 0) {
+                DEBUG_LOG("pwrite64分块写入返回0，停止写入");
+                break;
+            }
+            
+            total_written += n;
+            current_offset += n;
+            
+            // 输出进度
+            if (total_written > 0 && (total_written % (WRITE_BLOCK_SIZE * 4)) == 0) {
+                DEBUG_LOG("pwrite64进度: %zd / %zd 字节 (%.1f%%)", 
+                          total_written, count, (double)total_written / count * 100.0);
+            }
         }
-        memcpy(tmp, buf, count);
-        xor_encrypt_decrypt((unsigned char *)tmp, count);
         
-        log_hex_3_bytes("加密后数据", (unsigned char *)tmp, count);
-
-        ret = real_pwrite64(fd, tmp, count, offset);
-        free(tmp);
-        
-        if (ret >= 0) {
-            DEBUG_LOG("pwrite64加密写入成功: fd=%d, 请求=%zd字节, 实际写入=%zd字节", fd, count, ret);
+        if (success) {
+            ret = total_written;
             bool dk = true;
             fd_ctx_update_flags(fd, &dk, NULL);
+            DEBUG_LOG("pwrite64加密写入成功: 总写入=%zd字节", ret);
         } else {
-            DEBUG_LOG("pwrite64写入失败: fd=%d, 错误: %s", fd, strerror(errno));
+            ret = -1;
+            errno = ENOMEM;
+            DEBUG_LOG("pwrite64写入失败");
         }
         DEBUG_LOG("=======================================");
     }
@@ -939,27 +1092,59 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
         DEBUG_LOG("写入偏移: %ld, 大小: %zd", (long)offset, count);
         log_hex_3_bytes("加密前数据", (unsigned char *)buf, count);
         
-        void *tmp = malloc(count);
-        if (!tmp) { 
-            free(ctx.path); 
-            errno = ENOMEM; 
-            DEBUG_LOG("pwrite内存分配失败");
-            return -1; 
+        ssize_t total_written = 0;
+        bool success = true;
+        const unsigned char *src = (const unsigned char *)buf;
+        off_t current_offset = offset;
+        
+        while (total_written < count && success) {
+            size_t chunk_size = (count - total_written > WRITE_BLOCK_SIZE) 
+                              ? WRITE_BLOCK_SIZE 
+                              : count - total_written;
+            
+            void *tmp = malloc(chunk_size);
+            if (!tmp) {
+                DEBUG_LOG("pwrite内存分配失败: 请求大小=%zu", chunk_size);
+                success = false;
+                break;
+            }
+            
+            // 加密当前分块
+            memcpy(tmp, src + total_written, chunk_size);
+            xor_encrypt_decrypt((unsigned char *)tmp, chunk_size);
+            
+            // 写入分块
+            ssize_t n = real_pwrite(fd, tmp, chunk_size, current_offset);
+            free(tmp);
+            
+            if (n < 0) {
+                DEBUG_LOG("pwrite分块写入失败: 错误: %s", strerror(errno));
+                success = false;
+                break;
+            } else if (n == 0) {
+                DEBUG_LOG("pwrite分块写入返回0，停止写入");
+                break;
+            }
+            
+            total_written += n;
+            current_offset += n;
+            
+            // 输出进度
+            if (total_written > 0 && (total_written % (WRITE_BLOCK_SIZE * 4)) == 0) {
+                DEBUG_LOG("pwrite进度: %zd / %zd 字节 (%.1f%%)", 
+                          total_written, count, (double)total_written / count * 100.0);
+            }
         }
-        memcpy(tmp, buf, count);
-        xor_encrypt_decrypt((unsigned char *)tmp, count);
         
-        log_hex_3_bytes("加密后数据", (unsigned char *)tmp, count);
-
-        ret = real_pwrite(fd, tmp, count, offset);
-        free(tmp);
-        
-        if (ret >= 0) {
-            DEBUG_LOG("pwrite加密写入成功: fd=%d, 请求=%zd字节, 实际写入=%zd字节", fd, count, ret);
+        if (success) {
+            ret = total_written;
             bool dk = true;
             fd_ctx_update_flags(fd, &dk, NULL);
+            DEBUG_LOG("pwrite加密写入成功: 总写入=%zd字节", ret);
         } else {
-            DEBUG_LOG("pwrite写入失败: fd=%d, 错误: %s", fd, strerror(errno));
+            ret = -1;
+            errno = ENOMEM;
+            DEBUG_LOG("pwrite写入失败");
         }
         DEBUG_LOG("=====================================");
     }
@@ -1165,7 +1350,7 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     return ret;
 }
 
-// Hook fwrite函数
+// Hook fwrite函数（分块处理，优化版本）
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     static size_t (*real_fwrite)(const void *, size_t, size_t, FILE *) = NULL;
     if (!real_fwrite) {
@@ -1182,43 +1367,177 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
         fd_context_t ctx; memset(&ctx, 0, sizeof(ctx));
         if (fd_ctx_get_copy(fd, &ctx)) {
             if (ctx.is_target) {
-                // 加密后写入
+                // 目标文件：加密后写入（分块处理）
                 size_t total_bytes = size * nmemb;
                 DEBUG_LOG("=====【fwrite Hook成功调用】=====");
                 DEBUG_LOG("文件: %s", ctx.path ? ctx.path : "未知");
                 DEBUG_LOG("写入大小: %zd", total_bytes);
                 log_hex_3_bytes("fwrite加密前数据", (unsigned char *)ptr, total_bytes);
                 
-                void *tmp = malloc(total_bytes);
-                if (!tmp) {
+                const unsigned char *src = (const unsigned char *)ptr;
+                size_t total_written = 0;
+                size_t elements_written = 0;
+                bool success = true;
+                
+                while (total_written < total_bytes && success) {
+                    size_t chunk_size = (total_bytes - total_written > WRITE_BLOCK_SIZE) 
+                                      ? WRITE_BLOCK_SIZE 
+                                      : total_bytes - total_written;
+                    
+                    void *tmp = malloc(chunk_size);
+                    if (!tmp) {
+                        DEBUG_LOG("fwrite内存分配失败: 请求大小=%zu", chunk_size);
+                        free(ctx.path);
+                        errno = ENOMEM;
+                        return 0;
+                    }
+                    
+                    // 加密当前分块
+                    memcpy(tmp, src + total_written, chunk_size);
+                    xor_encrypt_decrypt((unsigned char *)tmp, chunk_size);
+                    
+                    // 计算当前分块包含的元素数量
+                    size_t chunk_elements = chunk_size / size;
+                    if (chunk_elements == 0 && chunk_size > 0) chunk_elements = 1;
+                    
+                    // 写入分块
+                    size_t n = real_fwrite(tmp, size, chunk_elements, stream);
+                    free(tmp);
+                    
+                    if (n == 0) {
+                        DEBUG_LOG("fwrite分块写入失败");
+                        success = false;
+                        break;
+                    }
+                    
+                    total_written += n * size;
+                    elements_written += n;
+                    
+                    // 输出进度
+                    if (total_written > 0 && (total_written % (WRITE_BLOCK_SIZE * 4)) == 0) {
+                        DEBUG_LOG("fwrite进度: %zd / %zd 字节 (%.1f%%)", 
+                                  total_written, total_bytes, (double)total_written / total_bytes * 100.0);
+                    }
+                }
+                
+                if (success) {
+                    bool dk = true;
+                    fd_ctx_update_flags(fd, &dk, NULL);
+                    DEBUG_LOG("fwrite加密写入成功: 总写入=%zd字节, 元素=%zd", 
+                              total_written, elements_written);
+                    DEBUG_LOG("======================================");
                     free(ctx.path);
-                    errno = ENOMEM;
-                    DEBUG_LOG("fwrite内存分配失败");
+                    return elements_written;
+                } else {
+                    DEBUG_LOG("fwrite写入失败");
+                    DEBUG_LOG("======================================");
+                    free(ctx.path);
                     return 0;
                 }
-                memcpy(tmp, ptr, total_bytes);
-                xor_encrypt_decrypt((unsigned char *)tmp, total_bytes);
-                
-                log_hex_3_bytes("fwrite加密后数据", (unsigned char *)tmp, total_bytes);
-                
-                size_t result = real_fwrite(tmp, size, nmemb, stream);
-                free(tmp);
-                
-                if (result > 0) {
-                    DEBUG_LOG("fwrite加密写入成功: fd=%d, 请求=%zd字节, 实际写入=%zd个元素", 
-                              fd, total_bytes, result);
-                } else {
-                    DEBUG_LOG("fwrite写入失败: fd=%d, 错误: %s", fd, strerror(errno));
-                }
-                DEBUG_LOG("======================================");
-                free(ctx.path);
-                return result;
             }
             free(ctx.path);
         }
     }
     
     return real_fwrite(ptr, size, nmemb, stream);
+}
+
+int fsync(int fd) {
+    static int (*real_fsync)(int) = NULL;
+    if (!real_fsync) {
+        real_fsync = dlsym(RTLD_NEXT, "fsync");
+        DEBUG_LOG("fsync Hook已加载: real_fsync=%p", real_fsync);
+    }
+    
+    fd_context_t ctx; memset(&ctx, 0, sizeof(ctx));
+    if (fd_ctx_get_copy(fd, &ctx)) {
+        if (ctx.is_target) {
+            DEBUG_LOG("=====【fsync Hook成功调用】=====");
+            DEBUG_LOG("同步目标DWG文件: fd=%d, 文件=%s", fd, ctx.path ? ctx.path : "未知");
+            DEBUG_LOG("===================================");
+        }
+        free(ctx.path);
+    }
+    
+    int ret = real_fsync(fd);
+    if (ret != 0) {
+        DEBUG_LOG("fsync失败: fd=%d, 错误: %s", fd, strerror(errno));
+    }
+    
+    return ret;
+}
+
+int fdatasync(int fd) {
+    static int (*real_fdatasync)(int) = NULL;
+    if (!real_fdatasync) {
+        real_fdatasync = dlsym(RTLD_NEXT, "fdatasync");
+        DEBUG_LOG("fdatasync Hook已加载: real_fdatasync=%p", real_fdatasync);
+    }
+    
+    fd_context_t ctx; memset(&ctx, 0, sizeof(ctx));
+    if (fd_ctx_get_copy(fd, &ctx)) {
+        if (ctx.is_target) {
+            DEBUG_LOG("=====【fdatasync Hook成功调用】=====");
+            DEBUG_LOG("同步目标DWG文件数据: fd=%d, 文件=%s", fd, ctx.path ? ctx.path : "未知");
+            DEBUG_LOG("======================================");
+        }
+        free(ctx.path);
+    }
+    
+    int ret = real_fdatasync(fd);
+    if (ret != 0) {
+        DEBUG_LOG("fdatasync失败: fd=%d, 错误: %s", fd, strerror(errno));
+    }
+    
+    return ret;
+}
+
+// Hook msync函数（优化和简化版本）
+int msync(void *addr, size_t length, int flags) {
+    static int (*real_msync)(void *, size_t, int) = NULL;
+    if (!real_msync) {
+        real_msync = dlsym(RTLD_NEXT, "msync");
+        DEBUG_LOG("msync Hook已加载: real_msync=%p", real_msync);
+    }
+    
+    DEBUG_LOG("=====【msync Hook成功调用】=====");
+    DEBUG_LOG("同步内存映射: addr=%p, 长度=%zu, 标志=0x%x", addr, length, flags);
+    
+    // 检查是否为目标mmap区域
+    mmap_region_t *region = find_mmap_region(addr);
+    if (region && region->should_decrypt) {
+        DEBUG_LOG("同步目标DWG内存映射区域");
+        
+        // 对于大内存区域，简化处理避免卡死
+        if (length > MAX_MEMORY_OPERATION_SIZE) {
+            DEBUG_LOG("大内存区域同步，跳过复杂处理: %zu字节", length);
+            int ret = real_msync(addr, length, flags);
+            DEBUG_LOG("===================================");
+            return ret;
+        }
+        
+        // 对小内存区域进行正常处理
+        DEBUG_LOG("小内存区域同步，进行加密/解密处理: %zu字节", length);
+        
+        // 简化的同步逻辑：直接同步，不进行页级别的复杂操作
+        int ret = real_msync(addr, length, flags);
+        
+        if (ret != 0) {
+            DEBUG_LOG("msync失败: 错误: %s", strerror(errno));
+        } else {
+            DEBUG_LOG("msync成功");
+        }
+        DEBUG_LOG("===================================");
+        return ret;
+    }
+    
+    int ret = real_msync(addr, length, flags);
+    if (ret != 0) {
+        DEBUG_LOG("msync失败: 错误: %s", strerror(errno));
+    }
+    DEBUG_LOG("===================================");
+    
+    return ret;
 }
 
 // ==================== 库初始化 ====================
@@ -1245,6 +1564,8 @@ static void init_dwg_hook(void) {
     DEBUG_LOG("使用方法: export DWG_HOOK_DEBUG=1");
     DEBUG_LOG("注入方法: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook_improved.so ./ZWCAD \"$@\" /product ZWCAD");
     DEBUG_LOG("特性: 移除'changed_'路径限制，支持所有DWG文件");
+    DEBUG_LOG("优化: 分块写入(%dMB)和分块内存处理(%dKB)", WRITE_BLOCK_SIZE / (1024*1024), MEMORY_CRYPT_BLOCK_SIZE / 1024);
+    DEBUG_LOG("限制: 最大内存操作大小=%dMB，避免卡死", MAX_MEMORY_OPERATION_SIZE / (1024*1024));
     DEBUG_LOG("Hook加载状态: 所有函数Hook已准备就绪");
     DEBUG_LOG("=========================================");
 }

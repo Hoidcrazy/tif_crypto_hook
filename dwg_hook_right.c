@@ -3,19 +3,11 @@
 // 编译命令:
 //   gcc -shared -fPIC -o libdwg_hook.so dwg_hook.c -ldl -lpthread
 //
-// 使用方法（挂载到中望CAD启动脚本）:
-//   1. 修改启动脚本 sudo vim /opt/apps/zwcad2025/ZWCADRUN.sh
-//   2. 注释原启动行: # ./ZWCAD "$@" /product ZWCAD
-//   3. 添加新行: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so ./ZWCAD "$@" /product ZWCAD
-//
 // 调试方法:
 //   设置环境变量开启调试日志: export DWG_HOOK_DEBUG=1
 //   重定向输出查看日志: LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so /opt/apps/zwcad2025/ZWCADRUN.sh
 
-// 文件路径: /home/chane/tif_crypto_hook/dwg_hook.c
 
-// 编译命令:
-//   gcc -shared -fPIC -o libdwg_hook.so dwg_hook.c -ldl -lpthread
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
