@@ -976,7 +976,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
         
         if (success) {
             ret = total_written;
-            bool dk = true;
+            int dk = true;
             fd_ctx_update_flags(fd, &dk, NULL);
             DEBUG_LOG("write加密写入成功: 总写入=%zd字节", ret);
         } else {
@@ -1057,7 +1057,7 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
         
         if (success) {
             ret = total_written;
-            bool dk = true;
+            int dk = true;
             fd_ctx_update_flags(fd, &dk, NULL);
             DEBUG_LOG("pwrite64加密写入成功: 总写入=%zd字节", ret);
         } else {
@@ -1138,7 +1138,7 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
         
         if (success) {
             ret = total_written;
-            bool dk = true;
+            int dk = true;
             fd_ctx_update_flags(fd, &dk, NULL);
             DEBUG_LOG("pwrite加密写入成功: 总写入=%zd字节", ret);
         } else {
@@ -1421,7 +1421,7 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
                 }
                 
                 if (success) {
-                    bool dk = true;
+                    int dk = true;
                     fd_ctx_update_flags(fd, &dk, NULL);
                     DEBUG_LOG("fwrite加密写入成功: 总写入=%zd字节, 元素=%zd", 
                               total_written, elements_written);
