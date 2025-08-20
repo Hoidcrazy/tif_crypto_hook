@@ -1,26 +1,3 @@
-/* 修改说明1（2025-08-19）
- * 目标：支持超大 DWG（> 200MB、GB 级）在 mmap 与读写路径上的高效透明解密/加密，
- * 修复此前“映射过大跳过立即解密”的限制，并显著降低大文件保存时的卡顿。
- *
- * 关键改动：
- * 1) 取消内存操作硬上限：删除/放宽 MAX_MEMORY_OPERATION_SIZE 的约束，允许对超大映射进行“分块+页对齐+mprotect”处理。
- * 2) 新增页尺寸缓存与页对齐工具：确保对 mprotect 的地址与长度严格页对齐，避免 EINVAL。
- * 3) mmap 大文件也做“流式解密”：不再因映射过大而跳过；改为循环分块处理，每块页对齐、提升写权、XOR（64 位批量）、恢复原保护、让出 CPU。
- * 4) XOR 加速：新增 xor_encrypt_decrypt_fast（64 位批处理 + 字节收尾）。
- * 5) 写入路径性能：新增线程局部缓冲区 get_tls_chunk_buf，避免每块 malloc/free；写入走批量 XOR。
- * 6) 修改标记：write/pwrite/fwrite 成功后标记相关 fd 的 mmap modified=true，munmap 前对被修改的映射做回写加密。
- * 7) 日志降噪：仅在关键进度输出日志；大块数据不打印十六进制。
- */
-
-/* 修改说明2（2025-08-19）
- * 修复：mmap(MAP_SHARED)+msync 导致明文落盘的问题。
- * 方法：在 msync/fsync/fdatasync/munmap 等可能触发落盘前，对将被同步的共享映射区
- *       做“临时加密 -> 调用真实同步 -> 立即解密”的包裹；从而保证磁盘永远保持密文。
- * 同时保留与优化：
- *  - 超大映射/文件：分块（2MB）页对齐 + mprotect，流式处理，避免卡顿。
- *  - write/pwrite/fwrite 仍旧在写入路径做加密（应对未走 mmap 的保存路径）。
- */
-
 // 文件路径: /home/chane/tif_crypto_hook/dwg_hook.c
 //
 // 编译命令:
