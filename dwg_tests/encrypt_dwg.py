@@ -13,6 +13,8 @@ encrypt_dwg.py - 对指定的 DWG 文件进行异或加密（包括 DWG Header�
     输出文件名格式为：changed_原文件名.dwg
     例如：changed_room.dwg
 """
+# hexdump -C dwg_tests/changed_20211015-渝北铜锣山矿山公园测绘成果图（ck6-13）（1：500）.dwg | head -n 1
+
 import os
 import sys
 
