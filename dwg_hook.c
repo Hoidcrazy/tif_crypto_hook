@@ -1,16 +1,5 @@
 /*
- * dwg_hook.c - DWG文件透明加解密Hook（修复版本）
- * 
- * 功能说明：
- * 1. 打开加密DWG文件时，在进程内解密为明文供CAD软件编辑，但磁盘文件保持密文状态
- * 2. 编辑保存时，将修改内容加密后写回磁盘，确保磁盘文件始终为密文
- * 3. hexdump等外部工具查看文件时始终看到密文数据
- * 
- * 核心策略：
- * - 对MAP_SHARED映射替换为MAP_PRIVATE私有副本，避免直接修改内核页缓存
- * - 在私有副本上解密供进程使用，磁盘文件不受影响
- * - 监控写入操作和文件重命名，适时将私有副本内容加密写回磁盘
- * - 修复：解决CAD原子保存导致的文件描述符失效问题
+ * dwg_hook.c
  * 
  * 编译命令：
  *   gcc -shared -fPIC -o libdwg_hook.so dwg_hook.c -ldl -lpthread
@@ -40,11 +29,22 @@
  #include <time.h>
  
  // ==================== 配置参数 ====================
+ #define ENABLE_RENAME_FULL_REWRITE    0                   // 禁用rename阶段整文件回写
  #define WRITE_BLOCK_SIZE              (512 * 1024)       // 写入分块大小：512KB
  #define MMAP_CRYPT_BLOCK             (2UL * 1024 * 1024) // 内存加解密分块：2MB
  #define MAX_PATH_LEN                  4096
  #define MAX_MMAP_REGIONS              4096               // 最大映射区域数量
  #define LOG_HEX_PREVIEW_BYTES         48                 // 日志中显示的十六进制字节数
+ 
+ // ==================== 内部IO护栏（防止重入） ====================
+ static __thread int tls_internal_io = 0;  // 0=外部调用; >0=库内自发调用
+ 
+ #define BEGIN_INTERNAL_IO()  do { tls_internal_io++; } while (0)
+ #define END_INTERNAL_IO()    do { tls_internal_io--; } while (0)
+ 
+ static inline int is_internal_io(void) { 
+     return tls_internal_io > 0; 
+ }
  
  // ==================== 调试日志系统 ====================
  static int g_debug_enabled = -1;
@@ -123,6 +123,8 @@
      char *path;
      int is_target_dwg;      // 是否为目标DWG文件
      int is_temp_file;       // 是否为临时文件
+     int should_encrypt_on_write;  // 是否应在写入时加密
+     int saw_plain_writes;   // 是否见过明文写入
      struct fd_context_s *next;
  } fd_context_t;
  
@@ -151,7 +153,6 @@
  
  static void fd_context_add(int fd, const char *path) {
      if (fd < 0) return;
-     DEBUG_LOG("标记fd相关映射为已修改: fd=%d", fd);
      
      pthread_mutex_lock(&fd_table_mutex);
      fd_context_t *node = calloc(1, sizeof(fd_context_t));
@@ -163,6 +164,8 @@
      node->fd = fd;
      if (path) node->path = strdup(path);
      node->is_target_dwg = is_target_dwg_file(path);
+     node->should_encrypt_on_write = node->is_target_dwg;
+     node->saw_plain_writes = 0;
      node->is_temp_file = (!node->is_target_dwg && path && 
                           (strstr(path, ".tmp") || strstr(path, "temp") || strstr(path, "~") ||
                            strstr(path, "zwTm") || strstr(path, "zwsave")));
@@ -217,6 +220,34 @@
          current = current->next;
      }
      pthread_mutex_unlock(&fd_table_mutex);
+     return 0;
+ }
+ 
+ // 标记路径需要在写入时加密
+ static void mark_path_encrypt_on_write(const char *path, int should_encrypt) {
+     if (!path) return;
+     
+     pthread_mutex_lock(&fd_table_mutex);
+     fd_context_t *current = fd_table;
+     while (current) {
+         if (current->path && strcmp(current->path, path) == 0) {
+             current->should_encrypt_on_write = should_encrypt;
+             DEBUG_LOG("标记路径写入加密: %s, 加密=%s", path, should_encrypt ? "是" : "否");
+         }
+         current = current->next;
+     }
+     pthread_mutex_unlock(&fd_table_mutex);
+ }
+ 
+ // 检查fd是否为目标DWG且需要写入加密
+ static int should_encrypt_write_for_fd(int fd) {
+     fd_context_t ctx;
+     memset(&ctx, 0, sizeof(ctx));
+     if (fd_context_get_info(fd, &ctx)) {
+         int result = ctx.is_target_dwg && ctx.should_encrypt_on_write;
+         if (ctx.path) free(ctx.path);
+         return result;
+     }
      return 0;
  }
  
@@ -354,9 +385,11 @@
  
      DEBUG_LOG("开始写回加密数据到文件: 路径=%s, 大小=%zu", file_path, size);
  
+     BEGIN_INTERNAL_IO();
      int fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
      if (fd < 0) {
          DEBUG_LOG("写回失败：无法打开文件 %s - %s", file_path, strerror(errno));
+         END_INTERNAL_IO();
          return -1;
      }
  
@@ -371,11 +404,13 @@
          if (written < 0) {
              DEBUG_LOG("写回失败：write错误 - %s", strerror(errno));
              close(fd);
+             END_INTERNAL_IO();
              return -1;
          }
          if ((size_t)written != chunk_size) {
              DEBUG_LOG("写回不完整：期望%zu字节，实际%zd字节", chunk_size, written);
              close(fd);
+             END_INTERNAL_IO();
              return -1;
          }
  
@@ -399,10 +434,48 @@
      }
  
      close(fd);
+     END_INTERNAL_IO();
      DEBUG_LOG("加密数据写回完成: 共写入%zu字节", total_written);
      return 0;
  }
  
+ // 收尾兜底：检查并修正可能的明文块
+ static void final_seal_if_needed(int fd) {
+     fd_context_t ctx;
+     memset(&ctx, 0, sizeof(ctx));
+     if (!fd_context_get_info(fd, &ctx) || !ctx.is_target_dwg) {
+         if (ctx.path) free(ctx.path);
+         return;
+     }
+     
+     if (!ctx.saw_plain_writes) {
+         DEBUG_LOG("fd=%d 未检测到明文写入，跳过收尾检查", fd);
+         if (ctx.path) free(ctx.path);
+         return;
+     }
+     
+     DEBUG_LOG("开始收尾检查: fd=%d, 路径=%s", fd, ctx.path ? ctx.path : "未知");
+     
+     BEGIN_INTERNAL_IO();
+     
+     // 简化实现：读取文件头检查是否为明文
+     unsigned char header[64];
+     ssize_t read_bytes = pread(fd, header, sizeof(header), 0);
+     if (read_bytes > 0) {
+         // 检查是否像DWG明文头（简单启发式）
+         if (read_bytes >= 6 && memcmp(header, "AC10", 4) == 0) {
+             DEBUG_LOG("检测到明文DWG头，进行加密修正");
+             for (ssize_t i = 0; i < read_bytes; i++) {
+                 header[i] ^= 0xFF;
+             }
+             pwrite(fd, header, read_bytes, 0);
+             DEBUG_LOG("收尾修正完成：修正了文件头 %zd 字节", read_bytes);
+         }
+     }
+     
+     END_INTERNAL_IO();
+     if (ctx.path) free(ctx.path);
+ }
  
  // 分块内存加解密函数（带内存保护处理）
  static int chunked_memory_crypto(void *addr, size_t length, const char *operation_name, 
@@ -513,7 +586,11 @@
  
  // 文件关闭时写回所有相关私有副本
  static void flush_private_copies_on_close(int original_fd) {
-     DEBUG_LOG("检查fd=%d的私有副本写回需求", original_fd);
+     if (!ENABLE_RENAME_FULL_REWRITE) {
+         DEBUG_LOG("已禁用close时私有副本写回: fd=%d", original_fd);
+         return;
+     }
+     
      pthread_mutex_lock(&mmap_table_mutex);
      for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
          mmap_region_t *region = &mmap_regions[i];
@@ -610,13 +687,21 @@
          DEBUG_LOG("close Hook已初始化: real_close=%p", real_close);
      }
      
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_close(fd);
+     }
+     
      // 检查是否为目标DWG文件，如果是则先写回相关私有副本
      fd_context_t ctx;
      if (fd_context_get_info(fd, &ctx)) {
          if (ctx.is_target_dwg) {
-             DEBUG_LOG("关闭目标DWG文件，先写回私有副本: fd=%d, 路径=%s", 
+             DEBUG_LOG("关闭目标DWG文件，执行收尾检查: fd=%d, 路径=%s", 
                       fd, ctx.path ? ctx.path : "(未知)");
-             flush_private_copies_on_close(fd);
+             final_seal_if_needed(fd);
+             if (ENABLE_RENAME_FULL_REWRITE) {
+                 flush_private_copies_on_close(fd);
+             }
          }
          if (ctx.path) free(ctx.path);
      }
@@ -631,6 +716,11 @@
      if (!real_read) {
          real_read = dlsym(RTLD_NEXT, "read");
          DEBUG_LOG("read Hook已初始化: real_read=%p", real_read);
+     }
+     
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_read(fd, buf, count);
      }
      
      ssize_t result = real_read(fd, buf, count);
@@ -662,6 +752,11 @@
      if (!real_fread) {
          real_fread = dlsym(RTLD_NEXT, "fread");
          DEBUG_LOG("fread Hook已初始化: real_fread=%p", real_fread);
+     }
+     
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_fread(ptr, size, nmemb, stream);
      }
      
      size_t result = real_fread(ptr, size, nmemb, stream);
@@ -699,19 +794,31 @@
          DEBUG_LOG("write Hook已初始化: real_write=%p", real_write);
      }
      
-     if (count == 0 || !buf) return real_write(fd, buf, count);
-     
-     fd_context_t ctx;
-     memset(&ctx, 0, sizeof(ctx));
-     if (!fd_context_get_info(fd, &ctx)) return real_write(fd, buf, count);
-     
-     if (!ctx.is_target_dwg) {
-         if (ctx.path) free(ctx.path);
+     // 内部IO护栏
+     if (is_internal_io()) {
          return real_write(fd, buf, count);
      }
      
-     // 目标DWG文件：分块加密写入
-     DEBUG_LOG("=====【写入Hook】文件=%s, 大小=%zu字节", ctx.path ? ctx.path : "未知", count);
+     if (count == 0 || !buf) return real_write(fd, buf, count);
+     
+     // 检查是否需要加密写入
+     if (!should_encrypt_write_for_fd(fd)) {
+         return real_write(fd, buf, count);
+     }
+     
+     // 标记见过明文写入
+     pthread_mutex_lock(&fd_table_mutex);
+     fd_context_t *current = fd_table;
+     while (current) {
+         if (current->fd == fd) {
+             current->saw_plain_writes = 1;
+             break;
+         }
+         current = current->next;
+     }
+     pthread_mutex_unlock(&fd_table_mutex);
+     
+     DEBUG_LOG("=====【写入Hook】fd=%d, 大小=%zu字节 (在线加密)", fd, count);
      
      const unsigned char *source = (const unsigned char *)buf;
      ssize_t total_written = 0;
@@ -723,16 +830,19 @@
          unsigned char *temp_buffer = get_thread_local_buffer(chunk_size);
          if (!temp_buffer) {
              errno = ENOMEM;
-             if (ctx.path) free(ctx.path);
              return -1;
          }
          
+         // 在线异或加密
          memcpy(temp_buffer, source + total_written, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
          
-         ssize_t written = real_write(fd, temp_buffer, chunk_size);
+         ssize_t written;
+         BEGIN_INTERNAL_IO();
+         written = real_write(fd, temp_buffer, chunk_size);
+         END_INTERNAL_IO();
+         
          if (written <= 0) {
-             if (ctx.path) free(ctx.path);
              return (written == 0) ? total_written : written;
          }
          
@@ -741,7 +851,6 @@
      
      // 标记相关映射已修改
      mark_mmap_modified_by_fd(fd);
-     if (ctx.path) free(ctx.path);
      return total_written;
  }
  
@@ -752,19 +861,19 @@
          DEBUG_LOG("pwrite64 Hook已初始化: real_pwrite64=%p", real_pwrite64);
      }
      
-     if (count == 0 || !buf) return real_pwrite64(fd, buf, count, offset);
-     
-     fd_context_t ctx;
-     memset(&ctx, 0, sizeof(ctx));
-     if (!fd_context_get_info(fd, &ctx)) return real_pwrite64(fd, buf, count, offset);
-     
-     if (!ctx.is_target_dwg) {
-         if (ctx.path) free(ctx.path);
+     // 内部IO护栏
+     if (is_internal_io()) {
          return real_pwrite64(fd, buf, count, offset);
      }
      
-     DEBUG_LOG("=====【pwrite64 Hook】文件=%s, 偏移=%ld, 大小=%zu", 
-              ctx.path ? ctx.path : "未知", (long)offset, count);
+     if (count == 0 || !buf) return real_pwrite64(fd, buf, count, offset);
+     
+     if (!should_encrypt_write_for_fd(fd)) {
+         return real_pwrite64(fd, buf, count, offset);
+     }
+     
+     DEBUG_LOG("=====【pwrite64 Hook】fd=%d, 偏移=%ld, 大小=%zu (在线加密)", 
+              fd, (long)offset, count);
      
      const unsigned char *source = (const unsigned char *)buf;
      ssize_t total_written = 0;
@@ -777,16 +886,18 @@
          unsigned char *temp_buffer = get_thread_local_buffer(chunk_size);
          if (!temp_buffer) {
              errno = ENOMEM;
-             if (ctx.path) free(ctx.path);
              return -1;
          }
          
          memcpy(temp_buffer, source + total_written, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
          
-         ssize_t written = real_pwrite64(fd, temp_buffer, chunk_size, current_offset);
+         ssize_t written;
+         BEGIN_INTERNAL_IO();
+         written = real_pwrite64(fd, temp_buffer, chunk_size, current_offset);
+         END_INTERNAL_IO();
+         
          if (written <= 0) {
-             if (ctx.path) free(ctx.path);
              return (written == 0) ? total_written : written;
          }
          
@@ -795,7 +906,6 @@
      }
      
      mark_mmap_modified_by_fd(fd);
-     if (ctx.path) free(ctx.path);
      return total_written;
  }
  
@@ -806,19 +916,19 @@
          DEBUG_LOG("pwrite Hook已初始化: real_pwrite=%p", real_pwrite);
      }
      
-     if (count == 0 || !buf) return real_pwrite(fd, buf, count, offset);
-     
-     fd_context_t ctx;
-     memset(&ctx, 0, sizeof(ctx));
-     if (!fd_context_get_info(fd, &ctx)) return real_pwrite(fd, buf, count, offset);
-     
-     if (!ctx.is_target_dwg) {
-         if (ctx.path) free(ctx.path);
+     // 内部IO护栏
+     if (is_internal_io()) {
          return real_pwrite(fd, buf, count, offset);
      }
      
-     DEBUG_LOG("=====【pwrite Hook】文件=%s, 偏移=%ld, 大小=%zu", 
-              ctx.path ? ctx.path : "未知", (long)offset, count);
+     if (count == 0 || !buf) return real_pwrite(fd, buf, count, offset);
+     
+     if (!should_encrypt_write_for_fd(fd)) {
+         return real_pwrite(fd, buf, count, offset);
+     }
+     
+     DEBUG_LOG("=====【pwrite Hook】fd=%d, 偏移=%ld, 大小=%zu (在线加密)", 
+              fd, (long)offset, count);
      
      const unsigned char *source = (const unsigned char *)buf;
      ssize_t total_written = 0;
@@ -831,16 +941,18 @@
          unsigned char *temp_buffer = get_thread_local_buffer(chunk_size);
          if (!temp_buffer) {
              errno = ENOMEM;
-             if (ctx.path) free(ctx.path);
              return -1;
          }
          
          memcpy(temp_buffer, source + total_written, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
          
-         ssize_t written = real_pwrite(fd, temp_buffer, chunk_size, current_offset);
+         ssize_t written;
+         BEGIN_INTERNAL_IO();
+         written = real_pwrite(fd, temp_buffer, chunk_size, current_offset);
+         END_INTERNAL_IO();
+         
          if (written <= 0) {
-             if (ctx.path) free(ctx.path);
              return (written == 0) ? total_written : written;
          }
          
@@ -849,7 +961,6 @@
      }
      
      mark_mmap_modified_by_fd(fd);
-     if (ctx.path) free(ctx.path);
      return total_written;
  }
  
@@ -860,6 +971,11 @@
          DEBUG_LOG("fwrite Hook已初始化: real_fwrite=%p", real_fwrite);
      }
      
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_fwrite(ptr, size, nmemb, stream);
+     }
+     
      if (!stream || !ptr || size == 0 || nmemb == 0) {
          return real_fwrite(ptr, size, nmemb, stream);
      }
@@ -867,17 +983,12 @@
      int fd = fileno(stream);
      if (fd < 0) return real_fwrite(ptr, size, nmemb, stream);
      
-     fd_context_t ctx;
-     memset(&ctx, 0, sizeof(ctx));
-     if (!fd_context_get_info(fd, &ctx)) return real_fwrite(ptr, size, nmemb, stream);
-     
-     if (!ctx.is_target_dwg) {
-         if (ctx.path) free(ctx.path);
+     if (!should_encrypt_write_for_fd(fd)) {
          return real_fwrite(ptr, size, nmemb, stream);
      }
      
      size_t total_bytes = size * nmemb;
-     DEBUG_LOG("=====【fwrite Hook】文件=%s, 字节数=%zu", ctx.path ? ctx.path : "未知", total_bytes);
+     DEBUG_LOG("=====【fwrite Hook】fd=%d, 字节数=%zu (在线加密)", fd, total_bytes);
      
      const unsigned char *source = (const unsigned char *)ptr;
      size_t written_bytes = 0;
@@ -890,7 +1001,6 @@
          unsigned char *temp_buffer = get_thread_local_buffer(chunk_size);
          if (!temp_buffer) {
              DEBUG_LOG("fwrite缓冲区分配失败");
-             if (ctx.path) free(ctx.path);
              return 0;
          }
          
@@ -900,10 +1010,13 @@
          size_t chunk_elements = chunk_size / size;
          if (chunk_elements == 0 && chunk_size > 0) chunk_elements = 1;
          
-         size_t written = real_fwrite(temp_buffer, size, chunk_elements, stream);
+         size_t written;
+         BEGIN_INTERNAL_IO();
+         written = real_fwrite(temp_buffer, size, chunk_elements, stream);
+         END_INTERNAL_IO();
+         
          if (written == 0) {
              DEBUG_LOG("fwrite分块写入失败");
-             if (ctx.path) free(ctx.path);
              return written_elements;
          }
          
@@ -912,7 +1025,6 @@
      }
      
      mark_mmap_modified_by_fd(fd);
-     if (ctx.path) free(ctx.path);
      return written_elements;
  }
  
@@ -1032,7 +1144,7 @@
      
      DEBUG_LOG("解除内存映射: 地址=%p, 长度=%zu", addr, length);
      
-     // 检查是否为需要保持的私有副本
+     // 检查是否为需要保持的私有副本，如果是则先备份再放行
      pthread_mutex_lock(&mmap_table_mutex);
      mmap_region_t *region = NULL;
      for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
@@ -1042,18 +1154,20 @@
          }
      }
      
-     if (region && region->should_preserve && region->is_target_dwg && region->is_private_copy) {
-         DEBUG_LOG("阻止DWG私有副本过早解除映射: 地址=%p, 长度=%zu, fd=%d", 
+     if (region && region->is_target_dwg && region->should_preserve) {
+         DEBUG_LOG("DWG私有副本解除映射前先备份: 地址=%p, 长度=%zu, fd=%d", 
                   addr, length, region->original_fd);
-         pthread_mutex_unlock(&mmap_table_mutex);
-         // 返回成功但不实际解除映射，保持私有副本存在
-         return 0;
+         // 在放行前先把内容备份（并加密到内存）
+         if (!region->encrypted_backup && region->length) {
+             create_encrypted_backup(region);
+         }
+         // 备份完后，可以放行 munmap
+         region->should_preserve = false;
      }
      pthread_mutex_unlock(&mmap_table_mutex);
      
      int result = real_munmap(addr, length);
      if (result == 0) {
-         DEBUG_LOG("解除映射成功: 地址=%p, 长度=%zu", addr, length);
          untrack_mmap_region(addr, length);
      } else {
          DEBUG_LOG("munmap执行失败: %s", strerror(errno));
@@ -1069,6 +1183,11 @@
          DEBUG_LOG("fsync Hook已初始化: real_fsync=%p", real_fsync);
      }
      
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_fsync(fd);
+     }
+     
      DEBUG_LOG("文件同步请求: fd=%d", fd);
      
      // 检查是否为目标DWG文件的fsync
@@ -1077,36 +1196,38 @@
      if (fd_context_get_info(fd, &ctx) && ctx.is_target_dwg) {
          DEBUG_LOG("目标DWG文件同步: fd=%d, 路径=%s", fd, ctx.path ? ctx.path : "(未知)");
          
-         // 强制写回所有相关的私有副本，确保数据同步
-         pthread_mutex_lock(&mmap_table_mutex);
-         for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-             mmap_region_t *region = &mmap_regions[i];
-             if (!region->addr) continue;
-             
-             if (region->original_fd == fd && region->is_target_dwg && 
-                 region->is_private_copy) {
-                 DEBUG_LOG("fsync时强制写回私有副本: fd=%d, 地址=%p, 长度=%zu", 
-                          fd, region->addr, region->length);
-                 DEBUG_LOG("fsync时强制写回私有副本: fd=%d, 地址=%p, 长度=%zu", 
-                          fd, region->addr, region->length);
+         // 执行收尾检查
+         final_seal_if_needed(fd);
+         
+         // 如果启用了整文件回写，则执行
+         if (ENABLE_RENAME_FULL_REWRITE) {
+             pthread_mutex_lock(&mmap_table_mutex);
+             for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                 mmap_region_t *region = &mmap_regions[i];
+                 if (!region->addr) continue;
                  
-                 if (region->file_path) {
-                     if (create_encrypted_backup(region) == 0) {
-                         if (write_encrypted_backup_to_file(region->file_path, 
-                                                           region->encrypted_backup, 
-                                                           region->backup_size) == 0) {
-                             DEBUG_LOG("fsync时私有副本写回成功: %s", region->file_path);
-                             region->has_modifications = false;
-                             // 写回成功后，允许解除映射
-                             region->should_preserve = false;
-                         } else {
-                             DEBUG_LOG("fsync时私有副本写回失败: %s", region->file_path);
+                 if (region->original_fd == fd && region->is_target_dwg && 
+                     region->is_private_copy) {
+                     DEBUG_LOG("fsync时强制写回私有副本: fd=%d, 地址=%p, 长度=%zu", 
+                              fd, region->addr, region->length);
+                     
+                     if (region->file_path) {
+                         if (create_encrypted_backup(region) == 0) {
+                             if (write_encrypted_backup_to_file(region->file_path, 
+                                                               region->encrypted_backup, 
+                                                               region->backup_size) == 0) {
+                                 DEBUG_LOG("fsync时私有副本写回成功: %s", region->file_path);
+                                 region->has_modifications = false;
+                                 region->should_preserve = false;
+                             } else {
+                                 DEBUG_LOG("fsync时私有副本写回失败: %s", region->file_path);
+                             }
                          }
                      }
                  }
              }
+             pthread_mutex_unlock(&mmap_table_mutex);
          }
-         pthread_mutex_unlock(&mmap_table_mutex);
      }
      if (ctx.path) free(ctx.path);
      
@@ -1124,6 +1245,11 @@
          DEBUG_LOG("fdatasync Hook已初始化: real_fdatasync=%p", real_fdatasync);
      }
      
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_fdatasync(fd);
+     }
+     
      DEBUG_LOG("文件数据同步请求: fd=%d", fd);
      
      // 检查是否为目标DWG文件的fdatasync
@@ -1132,35 +1258,37 @@
      if (fd_context_get_info(fd, &ctx) && ctx.is_target_dwg) {
          DEBUG_LOG("目标DWG文件数据同步: fd=%d, 路径=%s", fd, ctx.path ? ctx.path : "(未知)");
          
-         // 强制写回所有相关的私有副本
-         pthread_mutex_lock(&mmap_table_mutex);
-         for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-             mmap_region_t *region = &mmap_regions[i];
-             if (!region->addr) continue;
-             
-             if (region->original_fd == fd && region->is_target_dwg && 
-                 region->is_private_copy) {
-                 DEBUG_LOG("fdatasync时强制写回私有副本: fd=%d, 地址=%p, 长度=%zu, 已修改=%s", 
-                          fd, region->addr, region->length,
-                          region->has_modifications ? "是" : "否");
-                 DEBUG_LOG("fdatasync时写回私有副本: fd=%d, 地址=%p, 长度=%zu", 
-                          fd, region->addr, region->length);
+         // 执行收尾检查
+         final_seal_if_needed(fd);
+         
+         // 如果启用了整文件回写，则执行
+         if (ENABLE_RENAME_FULL_REWRITE) {
+             pthread_mutex_lock(&mmap_table_mutex);
+             for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                 mmap_region_t *region = &mmap_regions[i];
+                 if (!region->addr) continue;
                  
-                 if (region->file_path) {
-                     if (create_encrypted_backup(region) == 0) {
-                         if (write_encrypted_backup_to_file(region->file_path, 
-                                                           region->encrypted_backup, 
-                                                           region->backup_size) == 0) {
-                             DEBUG_LOG("fdatasync时私有副本写回成功: %s", region->file_path);
-                             region->has_modifications = false;
-                         } else {
-                             DEBUG_LOG("fdatasync时私有副本写回失败: %s", region->file_path);
+                 if (region->original_fd == fd && region->is_target_dwg && 
+                     region->is_private_copy) {
+                     DEBUG_LOG("fdatasync时强制写回私有副本: fd=%d, 地址=%p, 长度=%zu", 
+                              fd, region->addr, region->length);
+                     
+                     if (region->file_path) {
+                         if (create_encrypted_backup(region) == 0) {
+                             if (write_encrypted_backup_to_file(region->file_path, 
+                                                               region->encrypted_backup, 
+                                                               region->backup_size) == 0) {
+                                 DEBUG_LOG("fdatasync时私有副本写回成功: %s", region->file_path);
+                                 region->has_modifications = false;
+                             } else {
+                                 DEBUG_LOG("fdatasync时私有副本写回失败: %s", region->file_path);
+                             }
                          }
                      }
                  }
              }
+             pthread_mutex_unlock(&mmap_table_mutex);
          }
-         pthread_mutex_unlock(&mmap_table_mutex);
      }
      if (ctx.path) free(ctx.path);
      
@@ -1179,54 +1307,78 @@
          DEBUG_LOG("rename Hook已初始化: real_rename=%p", real_rename);
      }
  
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_rename(oldpath, newpath);
+     }
+ 
      if (oldpath && newpath) {
          if (is_target_dwg_file(oldpath) || is_target_dwg_file(newpath)) {
              DEBUG_LOG("DWG文件重命名操作: '%s' -> '%s'", oldpath, newpath);
          }
      }
  
-     /* 先执行真实的重命名，避免后续写回被覆盖 */
+     // 先执行真实的重命名
      int result = real_rename(oldpath, newpath);
      if (result != 0) {
          DEBUG_LOG("文件重命名失败: %s", strerror(errno));
          return result;
      }
  
-     /* 重命名成功后，如果新路径是目标DWG，则执行写回 */
+     // 重命名成功后的处理
      if (oldpath && newpath) {
          if (is_target_dwg_file(newpath)) {
-             DEBUG_LOG("检测到保存操作：临时文件 -> DWG文件");
+             DEBUG_LOG("检测到保存操作：临时文件 -> DWG文件 (仅标记，不做整文件回写)");
+             
+             // 标记新路径需要在写入时加密
+             mark_path_encrypt_on_write(newpath, 1);
+             
+             // 如果启用了整文件回写，则执行（默认禁用）
+             if (ENABLE_RENAME_FULL_REWRITE) {
+                 pthread_mutex_lock(&mmap_table_mutex);
+                 for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                     mmap_region_t *region = &mmap_regions[i];
+                     if (!region->addr || !region->is_target_dwg || !region->is_private_copy) continue;
  
-             pthread_mutex_lock(&mmap_table_mutex);
-             for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-                 mmap_region_t *region = &mmap_regions[i];
-                 if (!region->addr || !region->is_target_dwg || !region->is_private_copy) continue;
+                     DEBUG_LOG("rename时强制写回私有副本: addr=%p, 长度=%zu",
+                               region->addr, region->length);
  
-                 DEBUG_LOG("rename时强制写回私有副本: addr=%p, 长度=%zu, 路径=%s",
-                           region->addr, region->length, region->file_path ? region->file_path : "(无)");
+                     // 写回期间避免被提前解除映射
+                     bool prev_preserve = region->should_preserve;
+                     region->should_preserve = true;
  
-                 /* 写回期间避免被提前解除映射 */
-                 bool prev_preserve = region->should_preserve;
-                 region->should_preserve = true;
+                     if (create_encrypted_backup(region) == 0) {
+                         if (write_encrypted_backup_to_file(newpath,
+                                                           region->encrypted_backup,
+                                                           region->backup_size) == 0) {
+                             DEBUG_LOG("rename时私有副本写回成功: %s", newpath);
+                             region->has_modifications = false;
  
-                 if (create_encrypted_backup(region) == 0) {
-                     if (write_encrypted_backup_to_file(newpath,
-                                                       region->encrypted_backup,
-                                                       region->backup_size) == 0) {
-                         DEBUG_LOG("rename时私有副本写回成功: %s", newpath);
-                         region->has_modifications = false;
+                             if (region->file_path) free(region->file_path);
+                             region->file_path = strdup(newpath);
+                         } else {
+                             DEBUG_LOG("rename时私有副本写回失败: %s", newpath);
+                         }
+                     }
  
+                     // 恢复 preserve 标志
+                     region->should_preserve = prev_preserve;
+                 }
+                 pthread_mutex_unlock(&mmap_table_mutex);
+             } else {
+                 // 仅保留私有副本，延迟到 fsync/close 再处理
+                 pthread_mutex_lock(&mmap_table_mutex);
+                 for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                     mmap_region_t *region = &mmap_regions[i];
+                     if (region->addr && region->is_target_dwg && region->is_private_copy) {
+                         region->should_preserve = true;
                          if (region->file_path) free(region->file_path);
                          region->file_path = strdup(newpath);
-                     } else {
-                         DEBUG_LOG("rename时私有副本写回失败: %s", newpath);
+                         DEBUG_LOG("标记私有副本延迟处理: addr=%p, 新路径=%s", region->addr, newpath);
                      }
                  }
- 
-                 /* 恢复 preserve 标志（成功或失败都恢复为之前状态） */
-                 region->should_preserve = prev_preserve;
+                 pthread_mutex_unlock(&mmap_table_mutex);
              }
-             pthread_mutex_unlock(&mmap_table_mutex);
          }
      }
  
@@ -1240,54 +1392,78 @@
          DEBUG_LOG("renameat Hook已初始化: real_renameat=%p", real_renameat);
      }
  
+     // 内部IO护栏
+     if (is_internal_io()) {
+         return real_renameat(olddirfd, oldpath, newdirfd, newpath);
+     }
+ 
      if (oldpath && newpath) {
          if (is_target_dwg_file(oldpath) || is_target_dwg_file(newpath)) {
              DEBUG_LOG("DWG文件重命名操作（at版本）: '%s' -> '%s'", oldpath, newpath);
          }
      }
  
-     /* 先执行真实的重命名，避免后续写回被覆盖 */
+     // 先执行真实的重命名
      int result = real_renameat(olddirfd, oldpath, newdirfd, newpath);
      if (result != 0) {
          DEBUG_LOG("文件重命名（at版本）失败: %s", strerror(errno));
          return result;
      }
  
-     /* 重命名成功后，如果新路径是目标DWG，则执行写回 */
+     // 重命名成功后的处理
      if (oldpath && newpath) {
          if (is_target_dwg_file(newpath)) {
-             DEBUG_LOG("检测到保存操作（at版本）：临时文件 -> DWG文件");
+             DEBUG_LOG("检测到保存操作（at版本）：临时文件 -> DWG文件 (仅标记)");
+             
+             // 标记新路径需要在写入时加密
+             mark_path_encrypt_on_write(newpath, 1);
+             
+             // 如果启用了整文件回写，则执行（默认禁用）
+             if (ENABLE_RENAME_FULL_REWRITE) {
+                 pthread_mutex_lock(&mmap_table_mutex);
+                 for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                     mmap_region_t *region = &mmap_regions[i];
+                     if (!region->addr || !region->is_target_dwg || !region->is_private_copy) continue;
  
-             pthread_mutex_lock(&mmap_table_mutex);
-             for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-                 mmap_region_t *region = &mmap_regions[i];
-                 if (!region->addr || !region->is_target_dwg || !region->is_private_copy) continue;
+                     DEBUG_LOG("renameat时强制写回私有副本: addr=%p, 长度=%zu",
+                               region->addr, region->length);
  
-                 DEBUG_LOG("renameat时强制写回私有副本: addr=%p, 长度=%zu",
-                           region->addr, region->length);
+                     // 写回期间避免被提前解除映射
+                     bool prev_preserve = region->should_preserve;
+                     region->should_preserve = true;
  
-                 /* 写回期间避免被提前解除映射 */
-                 bool prev_preserve = region->should_preserve;
-                 region->should_preserve = true;
+                     if (create_encrypted_backup(region) == 0) {
+                         if (write_encrypted_backup_to_file(newpath,
+                                                           region->encrypted_backup,
+                                                           region->backup_size) == 0) {
+                             DEBUG_LOG("renameat时私有副本写回成功: %s", newpath);
+                             region->has_modifications = false;
  
-                 if (create_encrypted_backup(region) == 0) {
-                     if (write_encrypted_backup_to_file(newpath,
-                                                       region->encrypted_backup,
-                                                       region->backup_size) == 0) {
-                         DEBUG_LOG("renameat时私有副本写回成功: %s", newpath);
-                         region->has_modifications = false;
+                             if (region->file_path) free(region->file_path);
+                             region->file_path = strdup(newpath);
+                         } else {
+                             DEBUG_LOG("renameat时私有副本写回失败: %s", newpath);
+                         }
+                     }
  
+                     // 恢复 preserve 标志
+                     region->should_preserve = prev_preserve;
+                 }
+                 pthread_mutex_unlock(&mmap_table_mutex);
+             } else {
+                 // 仅保留私有副本，延迟到 fsync/close 再处理
+                 pthread_mutex_lock(&mmap_table_mutex);
+                 for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+                     mmap_region_t *region = &mmap_regions[i];
+                     if (region->addr && region->is_target_dwg && region->is_private_copy) {
+                         region->should_preserve = true;
                          if (region->file_path) free(region->file_path);
                          region->file_path = strdup(newpath);
-                     } else {
-                         DEBUG_LOG("renameat时私有副本写回失败: %s", newpath);
+                         DEBUG_LOG("标记私有副本延迟处理（at版本）: addr=%p, 新路径=%s", region->addr, newpath);
                      }
                  }
- 
-                 /* 恢复 preserve 标志（成功或失败都恢复为之前状态） */
-                 region->should_preserve = prev_preserve;
+                 pthread_mutex_unlock(&mmap_table_mutex);
              }
-             pthread_mutex_unlock(&mmap_table_mutex);
          }
      }
  
@@ -1331,6 +1507,7 @@
              DEBUG_LOG("清理时写回私有副本: 地址=%p, 长度=%zu, 路径=%s", 
                       region->addr, region->length, region->file_path);
              
+             BEGIN_INTERNAL_IO();
              if (create_encrypted_backup(region) == 0) {
                  if (write_encrypted_backup_to_file(region->file_path, 
                                                    region->encrypted_backup, 
@@ -1341,6 +1518,7 @@
                      DEBUG_LOG("清理写回失败");
                  }
              }
+             END_INTERNAL_IO();
              
              // 清理完成后，强制解除映射
              if (region->addr) {
