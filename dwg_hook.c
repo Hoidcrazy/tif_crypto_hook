@@ -6,7 +6,7 @@
  * 
  * 使用方法：
  *   export DWG_HOOK_DEBUG=1  # 可选：启用调试日志
- *   LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so /opt/apps/zwcad2025/ZWCADRUN.sh
+ *   LD_PRELOAD=/home/chane/tif_crypto_hook/libdwg_hook.so /opt/apps/zwcad2026/ZWCADRUN.sh
  */
 
 #define _GNU_SOURCE
@@ -29,7 +29,7 @@
 #include <time.h>
 
 // ==================== 配置参数 ====================
-#define ENABLE_RENAME_FULL_REWRITE    0                    // 0:禁用/1:启用 - rename阶段整文件回写
+#define ENABLE_RENAME_FULL_REWRITE    1                    // 0:禁用/1:启用 - rename阶段整文件回写
 #define WRITE_BLOCK_SIZE              (512 * 1024)         // 写入分块大小：512KB
 #define MMAP_CRYPT_BLOCK              (2UL * 1024 * 1024)  // 内存加解密分块：2MB
 #define MAX_PATH_LEN                  4096
@@ -477,7 +477,6 @@ static void final_seal_if_needed(int fd) {
     if (ctx.path) free(ctx.path);
 }
 
-
 // 分块内存加解密函数（带内存保护处理）
 static int chunked_memory_crypto(void *addr, size_t length, const char *operation_name, 
                                 int target_protection) {
@@ -529,6 +528,90 @@ static int chunked_memory_crypto(void *addr, size_t length, const char *operatio
 
 static int decrypt_memory_region(void *addr, size_t length, int target_protection) {
     return chunked_memory_crypto(addr, length, "内存解密", target_protection);
+}
+
+// 原子替换：对现有文件做整文件加密并原子覆盖（内部IO短路保护）
+static int encrypt_entire_file_inplace(const char *path) {
+    if (!path) return -1;
+    BEGIN_INTERNAL_IO();
+
+    // 打开源文件只读
+    int src = open(path, O_RDONLY | O_CLOEXEC);
+    if (src < 0) {
+        DEBUG_LOG("encrypt_inplace: 无法打开源文件 %s - %s", path, strerror(errno));
+        END_INTERNAL_IO();
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(src, &st) != 0) {
+        DEBUG_LOG("encrypt_inplace: fstat失败 %s - %s", path, strerror(errno));
+        close(src);
+        END_INTERNAL_IO();
+        return -1;
+    }
+    off_t filesize = st.st_size;
+
+    // 创建临时文件（同目录）
+    char tmp_path[MAX_PATH_LEN];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.%s.encrypttmp", path, "dwg");
+    int dst = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st.st_mode & 0777);
+    if (dst < 0) {
+        DEBUG_LOG("encrypt_inplace: 无法创建临时文件 %s - %s", tmp_path, strerror(errno));
+        close(src);
+        END_INTERNAL_IO();
+        return -1;
+    }
+
+    // 分块读写并异或加密
+    ssize_t offset = 0;
+    size_t buf_sz = WRITE_BLOCK_SIZE;
+    unsigned char *buf = malloc(buf_sz);
+    if (!buf) {
+        DEBUG_LOG("encrypt_inplace: 内存分配失败");
+        close(src); close(dst);
+        unlink(tmp_path);
+        END_INTERNAL_IO();
+        return -1;
+    }
+
+    while (offset < filesize) {
+        ssize_t toread = (filesize - offset > (off_t)buf_sz) ? buf_sz : (size_t)(filesize - offset);
+        ssize_t r = pread(src, buf, toread, offset);
+        if (r <= 0) { DEBUG_LOG("encrypt_inplace: read失败 %s", strerror(errno)); break; }
+        xor_encrypt_decrypt_optimized(buf, r);
+        ssize_t w = write(dst, buf, r);
+        if (w != r) { DEBUG_LOG("encrypt_inplace: write失败 %s", strerror(errno)); break; }
+        offset += r;
+    }
+
+    // 强制写盘
+    fsync(dst);
+    close(dst);
+    free(buf);
+    close(src);
+
+    // 原子替换
+    if (rename(tmp_path, path) != 0) {
+        DEBUG_LOG("encrypt_inplace: rename覆盖失败 %s -> %s : %s", tmp_path, path, strerror(errno));
+        unlink(tmp_path);
+        END_INTERNAL_IO();
+        return -1;
+    }
+
+    // 最好再一次 fsync 所在目录以保证目录条目持久化
+    char dirpath[MAX_PATH_LEN];
+    strncpy(dirpath, path, sizeof(dirpath)-1);
+    char *slash = strrchr(dirpath, '/');
+    if (slash) {
+        *slash = '\0';
+        int dfd = open(dirpath, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+        if (dfd >= 0) { fsync(dfd); close(dfd); }
+    }
+    DEBUG_LOG("encrypt_inplace: 对 %s 完成整文件加密替换", path);
+
+    END_INTERNAL_IO();
+    return 0;
 }
 
 // ==================== 映射区域跟踪函数 ====================
@@ -1380,6 +1463,13 @@ int rename(const char *oldpath, const char *newpath) {
                 }
                 pthread_mutex_unlock(&mmap_table_mutex);
             }
+
+            // 在rename完成后对目标文件做整文件加密
+            if (encrypt_entire_file_inplace(newpath) == 0) {
+                DEBUG_LOG("rename后整文件加密替换完成: %s", newpath);
+            } else {
+                DEBUG_LOG("rename后整文件加密替换失败: %s", newpath);
+            }
         }
     }
 
@@ -1464,6 +1554,13 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
                     }
                 }
                 pthread_mutex_unlock(&mmap_table_mutex);
+            }
+
+            // 在rename完成后对目标文件做整文件加密
+            if (encrypt_entire_file_inplace(newpath) == 0) {
+                DEBUG_LOG("rename后整文件加密替换完成: %s", newpath);
+            } else {
+                DEBUG_LOG("rename后整文件加密替换失败: %s", newpath);
             }
         }
     }
