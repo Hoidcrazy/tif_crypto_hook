@@ -1,8 +1,8 @@
 /*
- * dwg_hook.c
+ * dwg_hook_improved.c
  * 
  * 编译命令：
- *   gcc -shared -fPIC -o libdwg_hook.so dwg_hook.c -ldl -lpthread
+ *   gcc -shared -fPIC -o libdwg_hook.so dwg_hook_improved.c -ldl -lpthread
  * 
  * 使用方法：
  *   export DWG_HOOK_DEBUG=1  # 可选：启用调试日志
@@ -121,10 +121,10 @@
  typedef struct fd_context_s {
      int fd;
      char *path;
-     int is_target_dwg;      // 是否为目标DWG文件
-     int is_temp_file;       // 是否为临时文件
-     int should_encrypt_on_write;  // 是否应在写入时加密
-     int saw_plain_writes;   // 是否见过明文写入
+     int is_target_dwg;              // 是否为目标DWG文件
+     int is_temp_file;               // 是否为临时文件
+     int should_encrypt_on_write;    // 是否应在写入时加密（方案2核心标记）
+     int saw_plain_writes;           // 是否见过明文写入
      struct fd_context_s *next;
  } fd_context_t;
  
@@ -151,6 +151,21 @@
      return 1;
  }
  
+ // 【方案2新增】判断是否为临时文件（需要写入时加密）
+ static int is_temporary_file(const char *path) {
+     if (!path) return 0;
+     
+     // 检测各种临时文件模式
+     if (strstr(path, ".tmp") || strstr(path, ".TMP") || 
+         strstr(path, "temp") || strstr(path, "TEMP") ||
+         strstr(path, "zwTm") || strstr(path, "zwsave") ||
+         strstr(path, "autosave") || strstr(path, "~")) {
+         return 1;
+     }
+     
+     return 0;
+ }
+ 
  static void fd_context_add(int fd, const char *path) {
      if (fd < 0) return;
      
@@ -164,17 +179,28 @@
      node->fd = fd;
      if (path) node->path = strdup(path);
      node->is_target_dwg = is_target_dwg_file(path);
-     node->should_encrypt_on_write = node->is_target_dwg;
-     node->saw_plain_writes = 0;
+     
+     // 检测临时文件
      node->is_temp_file = (!node->is_target_dwg && path && 
                           (strstr(path, ".tmp") || strstr(path, "temp") || strstr(path, "~") ||
                            strstr(path, "zwTm") || strstr(path, "zwsave")));
      
+     // 方案2：临时文件也需要加密写入（防止明文落盘）
+     node->should_encrypt_on_write = node->is_target_dwg || node->is_temp_file;
+     
+     
      node->next = fd_table;
      fd_table = node;
      
-     if (node->is_target_dwg) {
-         DEBUG_LOG("添加目标DWG文件上下文: fd=%d, 路径=%s", fd, path ? path : "(空)");
+     if (node->is_target_dwg || node->is_temp_file) {
+         DEBUG_LOG("添加文件上下文: fd=%d, 路径=%s, 目标DWG=%s, 临时文件=%s, 需要加密写入=%s", 
+                  fd, path ? path : "(空)", 
+                  node->is_target_dwg ? "是" : "否",
+                  node->is_temp_file ? "是" : "否",
+                  node->should_encrypt_on_write ? "是" : "否");
+     } else if (node->is_temp_file) {
+         DEBUG_LOG("添加临时文件上下文（方案2）: fd=%d, 路径=%s, 需要写入加密=%s", 
+                  fd, path ? path : "(空)", node->should_encrypt_on_write ? "是" : "否");
      }
      
      pthread_mutex_unlock(&fd_table_mutex);
@@ -190,6 +216,9 @@
              
              if (to_remove->is_target_dwg) {
                  DEBUG_LOG("移除目标DWG文件上下文: fd=%d, 路径=%s", 
+                          fd, to_remove->path ? to_remove->path : "(空)");
+             } else if (to_remove->is_temp_file) {
+                 DEBUG_LOG("移除临时文件上下文: fd=%d, 路径=%s", 
                           fd, to_remove->path ? to_remove->path : "(空)");
              }
              
@@ -213,6 +242,7 @@
              out->fd = current->fd;
              out->is_target_dwg = current->is_target_dwg;
              out->is_temp_file = current->is_temp_file;
+             out->should_encrypt_on_write = current->should_encrypt_on_write;
              if (current->path) out->path = strdup(current->path);
              pthread_mutex_unlock(&fd_table_mutex);
              return 1;
@@ -223,7 +253,7 @@
      return 0;
  }
  
- // 标记路径需要在写入时加密
+ // 【方案2新增】根据路径标记需要写入时加密
  static void mark_path_encrypt_on_write(const char *path, int should_encrypt) {
      if (!path) return;
      
@@ -239,12 +269,12 @@
      pthread_mutex_unlock(&fd_table_mutex);
  }
  
- // 检查fd是否为目标DWG且需要写入加密
+ // 【方案2核心】检查fd是否需要写入时加密
  static int should_encrypt_write_for_fd(int fd) {
      fd_context_t ctx;
      memset(&ctx, 0, sizeof(ctx));
      if (fd_context_get_info(fd, &ctx)) {
-         int result = ctx.is_target_dwg && ctx.should_encrypt_on_write;
+         int result = ctx.should_encrypt_on_write;
          if (ctx.path) free(ctx.path);
          return result;
      }
@@ -705,6 +735,46 @@
  
  // ==================== 系统调用Hook实现 ====================
  
+ // 【方案2增强】openat Hook - 支持相对路径的打开操作（只保留一个版本）
+ int openat(int dirfd, const char *pathname, int flags, ...) {
+     static int (*real_openat)(int, const char *, int, mode_t) = NULL;
+     if (!real_openat) {
+         real_openat = dlsym(RTLD_NEXT, "openat");
+         DEBUG_LOG("openat Hook已初始化: real_openat=%p", real_openat);
+     }
+     
+     mode_t mode = 0;
+     if (flags & O_CREAT) {
+         va_list args;
+         va_start(args, flags);
+         mode = (mode_t)va_arg(args, int);
+         va_end(args);
+     }
+     
+     // 【方案2】检查是否为临时文件，如果是则标记需要写入加密
+     if (pathname && is_temporary_file(pathname)) {
+         DEBUG_LOG("【方案2】检测到临时文件（openat）: %s", pathname);
+     }
+     
+     int fd = real_openat(dirfd, pathname, flags, mode);
+     if (fd >= 0) {
+         // 构建完整路径（如果需要的话）
+         char *full_path = NULL;
+         if (pathname && pathname[0] != '/') {
+             // 相对路径需要结合 dirfd 来构建完整路径
+             // 简化处理：直接使用相对路径名
+             full_path = strdup(pathname);
+         } else {
+             full_path = pathname ? strdup(pathname) : NULL;
+         }
+         
+         fd_context_add(fd, full_path);
+         
+         if (full_path) free(full_path);
+     }
+     return fd;
+ }
+ 
  // open系列函数Hook
  int open(const char *pathname, int flags, ...) {
      static int (*real_open)(const char *, int, mode_t) = NULL;
@@ -719,6 +789,11 @@
          va_start(args, flags);
          mode = (mode_t)va_arg(args, int);
          va_end(args);
+     }
+     
+     // 【方案2】检查是否为临时文件，如果是则在日志中标记
+     if (pathname && is_temporary_file(pathname)) {
+         DEBUG_LOG("【方案2】检测到临时文件（open）: %s", pathname);
      }
      
      int fd = real_open(pathname, flags, mode);
@@ -743,6 +818,11 @@
          va_end(args);
      }
      
+     // 【方案2】检查是否为临时文件
+     if (pathname && is_temporary_file(pathname)) {
+         DEBUG_LOG("【方案2】检测到临时文件（open64）: %s", pathname);
+     }
+     
      int fd = real_open64(pathname, flags, mode);
      if (fd >= 0) {
          fd_context_add(fd, pathname);
@@ -755,6 +835,11 @@
      if (!real_creat) {
          real_creat = dlsym(RTLD_NEXT, "creat");
          DEBUG_LOG("creat Hook已初始化: real_creat=%p", real_creat);
+     }
+     
+     // 【方案2】检查是否为临时文件
+     if (pathname && is_temporary_file(pathname)) {
+         DEBUG_LOG("【方案2】检测到临时文件（creat）: %s", pathname);
      }
      
      int fd = real_creat(pathname, mode);
@@ -870,7 +955,7 @@
      return result;
  }
  
- // write系列函数Hook（加密后写入磁盘）
+ // 【方案2增强】write系列函数Hook（加密后写入磁盘）
  ssize_t write(int fd, const void *buf, size_t count) {
      static ssize_t (*real_write)(int, const void *, size_t) = NULL;
      if (!real_write) {
@@ -885,7 +970,7 @@
      
      if (count == 0 || !buf) return real_write(fd, buf, count);
      
-     // 检查是否需要加密写入
+     // 【方案2】检查是否需要加密写入（包含临时文件和目标DWG文件）
      if (!should_encrypt_write_for_fd(fd)) {
          return real_write(fd, buf, count);
      }
@@ -902,7 +987,7 @@
      }
      pthread_mutex_unlock(&fd_table_mutex);
      
-     DEBUG_LOG("=====【写入Hook】fd=%d, 大小=%zu字节 (在线加密)", fd, count);
+     DEBUG_LOG("=====【写入Hook】fd=%d, 大小=%zu字节 (方案2在线加密)", fd, count);
      
      const unsigned char *source = (const unsigned char *)buf;
      ssize_t total_written = 0;
@@ -917,9 +1002,14 @@
              return -1;
          }
          
-         // 在线异或加密
+         // 【方案2】在线异或加密
          memcpy(temp_buffer, source + total_written, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
+         
+         if (total_written == 0 && chunk_size >= 16) {
+             log_hex_preview("【方案2】加密前数据", source, chunk_size > 64 ? 64 : chunk_size);
+             log_hex_preview("【方案2】加密后数据", temp_buffer, chunk_size > 64 ? 64 : chunk_size);
+         }
          
          ssize_t written;
          BEGIN_INTERNAL_IO();
@@ -952,11 +1042,12 @@
      
      if (count == 0 || !buf) return real_pwrite64(fd, buf, count, offset);
      
+     // 【方案2】检查是否需要加密写入
      if (!should_encrypt_write_for_fd(fd)) {
          return real_pwrite64(fd, buf, count, offset);
      }
      
-     DEBUG_LOG("=====【pwrite64 Hook】fd=%d, 偏移=%ld, 大小=%zu (在线加密)", 
+     DEBUG_LOG("=====【pwrite64 Hook】fd=%d, 偏移=%ld, 大小=%zu (方案2在线加密)", 
               fd, (long)offset, count);
      
      const unsigned char *source = (const unsigned char *)buf;
@@ -973,6 +1064,7 @@
              return -1;
          }
          
+         // 【方案2】加密处理
          memcpy(temp_buffer, source + total_written, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
          
@@ -1007,11 +1099,12 @@
      
      if (count == 0 || !buf) return real_pwrite(fd, buf, count, offset);
      
+     // 【方案2】检查是否需要加密写入
      if (!should_encrypt_write_for_fd(fd)) {
          return real_pwrite(fd, buf, count, offset);
      }
      
-     DEBUG_LOG("=====【pwrite Hook】fd=%d, 偏移=%ld, 大小=%zu (在线加密)", 
+     DEBUG_LOG("=====【pwrite Hook】fd=%d, 偏移=%ld, 大小=%zu (方案2在线加密)", 
               fd, (long)offset, count);
      
      const unsigned char *source = (const unsigned char *)buf;
@@ -1028,6 +1121,7 @@
              return -1;
          }
          
+         // 【方案2】加密处理
          memcpy(temp_buffer, source + total_written, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
          
@@ -1048,6 +1142,7 @@
      return total_written;
  }
  
+ // 【方案2增强】fwrite Hook
  size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
      static size_t (*real_fwrite)(const void *, size_t, size_t, FILE *) = NULL;
      if (!real_fwrite) {
@@ -1067,12 +1162,14 @@
      int fd = fileno(stream);
      if (fd < 0) return real_fwrite(ptr, size, nmemb, stream);
      
+     // 【方案2】检查是否需要加密写入
      if (!should_encrypt_write_for_fd(fd)) {
          return real_fwrite(ptr, size, nmemb, stream);
      }
      
      size_t total_bytes = size * nmemb;
-     DEBUG_LOG("=====【fwrite Hook】fd=%d, 字节数=%zu (在线加密)", fd, total_bytes);
+     DEBUG_LOG("=====【fwrite Hook】fd=%d, 字节数=%zu (方案2在线加密)", fd, total_bytes);
+     DEBUG_LOG("【方案2执行】对fwrite数据进行实时XOR加密");
      
      const unsigned char *source = (const unsigned char *)ptr;
      size_t written_bytes = 0;
@@ -1088,6 +1185,7 @@
              return 0;
          }
          
+         // 【方案2】加密处理
          memcpy(temp_buffer, source + written_bytes, chunk_size);
          xor_encrypt_decrypt_optimized(temp_buffer, chunk_size);
          
@@ -1144,11 +1242,12 @@
      }
      
      if (is_target && (flags & MAP_SHARED)) {
-         // 关键策略：将MAP_SHARED替换为MAP_PRIVATE
+         // 【方案1】关键策略：将MAP_SHARED替换为MAP_PRIVATE
          // 这样创建私有副本，不会影响内核页缓存和磁盘文件
          int modified_flags = (flags & ~MAP_SHARED) | MAP_PRIVATE;
          
-         DEBUG_LOG("检测到目标DWG的MAP_SHARED映射，转换为MAP_PRIVATE私有副本");
+         DEBUG_LOG("【方案1】检测到目标DWG的MAP_SHARED映射，转换为MAP_PRIVATE私有副本");
+         DEBUG_LOG("【方案1生效】创建私有副本避免直接修改磁盘文件");
          DEBUG_LOG("映射参数: 地址=%p, 长度=%zu, 保护=%d, 原始标志=0x%x, 修改标志=0x%x, fd=%d", 
                   addr, length, prot, flags, modified_flags, fd);
          
@@ -1239,7 +1338,7 @@
      }
      
      if (region && region->is_target_dwg && region->should_preserve) {
-         DEBUG_LOG("DWG私有副本解除映射前先备份: 地址=%p, 长度=%zu, fd=%d", 
+         DEBUG_LOG("【方案1】DWG私有副本解除映射前先备份: 地址=%p, 长度=%zu, fd=%d", 
                   addr, length, region->original_fd);
          // 在放行前先把内容备份（并加密到内存）
          if (!region->encrypted_backup && region->length) {
@@ -1400,6 +1499,10 @@
          if (is_target_dwg_file(oldpath) || is_target_dwg_file(newpath)) {
              DEBUG_LOG("DWG文件重命名操作: '%s' -> '%s'", oldpath, newpath);
          }
+         // 【方案2】临时文件重命名为目标DWG文件
+         if (is_temporary_file(oldpath) && is_target_dwg_file(newpath)) {
+             DEBUG_LOG("【方案2】检测到临时文件保存为DWG: '%s' -> '%s'", oldpath, newpath);
+         }
      }
  
      // 先执行真实的重命名
@@ -1412,9 +1515,9 @@
      // 重命名成功后的处理
      if (oldpath && newpath) {
          if (is_target_dwg_file(newpath)) {
-             DEBUG_LOG("检测到保存操作：临时文件 -> DWG文件 (仅标记，不做整文件回写)");
+             DEBUG_LOG("检测到保存操作：临时文件 -> DWG文件");
              
-             // 标记新路径需要在写入时加密
+             // 【方案2】标记新路径需要在写入时加密
              mark_path_encrypt_on_write(newpath, 1);
              
              // 如果启用了整文件回写，则执行（默认禁用）
@@ -1424,7 +1527,7 @@
                      mmap_region_t *region = &mmap_regions[i];
                      if (!region->addr || !region->is_target_dwg || !region->is_private_copy) continue;
  
-                     DEBUG_LOG("rename时强制写回私有副本: addr=%p, 长度=%zu",
+                     DEBUG_LOG("【方案1】rename时强制写回私有副本: addr=%p, 长度=%zu",
                                region->addr, region->length);
  
                      // 写回期间避免被提前解除映射
@@ -1450,7 +1553,7 @@
                  }
                  pthread_mutex_unlock(&mmap_table_mutex);
              } else {
-                 // 仅保留私有副本，延迟到 fsync/close 再处理
+                 // 【方案1】仅保留私有副本，延迟到 fsync/close 再处理
                  pthread_mutex_lock(&mmap_table_mutex);
                  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
                      mmap_region_t *region = &mmap_regions[i];
@@ -1458,13 +1561,13 @@
                          region->should_preserve = true;
                          if (region->file_path) free(region->file_path);
                          region->file_path = strdup(newpath);
-                         DEBUG_LOG("标记私有副本延迟处理: addr=%p, 新路径=%s", region->addr, newpath);
+                         DEBUG_LOG("【方案1】标记私有副本延迟处理: addr=%p, 新路径=%s", region->addr, newpath);
                      }
                  }
                  pthread_mutex_unlock(&mmap_table_mutex);
              }
  
-             // 在rename完成后对目标文件做整文件加密
+             // 在rename完成后对目标文件做整文件加密（兜底保护）
              if (encrypt_entire_file_inplace(newpath) == 0) {
                  DEBUG_LOG("rename后整文件加密替换完成: %s", newpath);
              } else {
@@ -1492,6 +1595,10 @@
          if (is_target_dwg_file(oldpath) || is_target_dwg_file(newpath)) {
              DEBUG_LOG("DWG文件重命名操作（at版本）: '%s' -> '%s'", oldpath, newpath);
          }
+         // 【方案2】临时文件重命名为目标DWG文件
+         if (is_temporary_file(oldpath) && is_target_dwg_file(newpath)) {
+             DEBUG_LOG("【方案2】检测到临时文件保存为DWG（at版本）: '%s' -> '%s'", oldpath, newpath);
+         }
      }
  
      // 先执行真实的重命名
@@ -1504,9 +1611,9 @@
      // 重命名成功后的处理
      if (oldpath && newpath) {
          if (is_target_dwg_file(newpath)) {
-             DEBUG_LOG("检测到保存操作（at版本）：临时文件 -> DWG文件 (仅标记)");
+             DEBUG_LOG("检测到保存操作（at版本）：临时文件 -> DWG文件");
              
-             // 标记新路径需要在写入时加密
+             // 【方案2】标记新路径需要在写入时加密
              mark_path_encrypt_on_write(newpath, 1);
              
              // 如果启用了整文件回写，则执行（默认禁用）
@@ -1516,7 +1623,7 @@
                      mmap_region_t *region = &mmap_regions[i];
                      if (!region->addr || !region->is_target_dwg || !region->is_private_copy) continue;
  
-                     DEBUG_LOG("renameat时强制写回私有副本: addr=%p, 长度=%zu",
+                     DEBUG_LOG("【方案1】renameat时强制写回私有副本: addr=%p, 长度=%zu",
                                region->addr, region->length);
  
                      // 写回期间避免被提前解除映射
@@ -1542,7 +1649,7 @@
                  }
                  pthread_mutex_unlock(&mmap_table_mutex);
              } else {
-                 // 仅保留私有副本，延迟到 fsync/close 再处理
+                 // 【方案1】仅保留私有副本，延迟到 fsync/close 再处理
                  pthread_mutex_lock(&mmap_table_mutex);
                  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
                      mmap_region_t *region = &mmap_regions[i];
@@ -1550,17 +1657,17 @@
                          region->should_preserve = true;
                          if (region->file_path) free(region->file_path);
                          region->file_path = strdup(newpath);
-                         DEBUG_LOG("标记私有副本延迟处理（at版本）: addr=%p, 新路径=%s", region->addr, newpath);
+                         DEBUG_LOG("【方案1】标记私有副本延迟处理（at版本）: addr=%p, 新路径=%s", region->addr, newpath);
                      }
                  }
                  pthread_mutex_unlock(&mmap_table_mutex);
              }
  
-             // 在rename完成后对目标文件做整文件加密
+             // 在rename完成后对目标文件做整文件加密（兜底保护）
              if (encrypt_entire_file_inplace(newpath) == 0) {
-                 DEBUG_LOG("rename后整文件加密替换完成: %s", newpath);
+                 DEBUG_LOG("renameat后整文件加密替换完成: %s", newpath);
              } else {
-                 DEBUG_LOG("rename后整文件加密替换失败: %s", newpath);
+                 DEBUG_LOG("renameat后整文件加密替换失败: %s", newpath);
              }
          }
      }
@@ -1581,11 +1688,19 @@
      }
      
      DEBUG_LOG("=============================================");
-     DEBUG_LOG("DWG文件透明加解密Hook库 - 修复版本");
+     DEBUG_LOG("DWG文件透明加解密Hook库 - 双方案修复版本");
+     DEBUG_LOG("方案1: 进程内明文编辑（mmap私有副本）");
+     DEBUG_LOG("方案2: 临时文件写入时直接加密");
+     DEBUG_LOG("【方案1】mmap私有副本机制: 已启用");
+     DEBUG_LOG("【方案2】临时文件写入加密: 已启用");
+     DEBUG_LOG("【双保险】两套方案同时工作，确保无明文落盘");
      DEBUG_LOG("功能: 进程内明文编辑，磁盘保持密文状态");
-     DEBUG_LOG("修复: 解决CAD原子保存导致的文件描述符失效问题");
+     DEBUG_LOG("双保险机制: 方案1(mmap私有副本) + 方案2(临时文件写入加密)");
      DEBUG_LOG("调试模式: %s", is_debug_enabled() ? "已启用" : "已禁用");
+     DEBUG_LOG("方案1状态: 已启用 (mmap MAP_SHARED->MAP_PRIVATE)");
+     DEBUG_LOG("方案2状态: 已启用 (临时文件写入时直接加密)");
      DEBUG_LOG("编译时间: %s %s", __DATE__, __TIME__);
+     DEBUG_LOG("整文件回写模式: %s", ENABLE_RENAME_FULL_REWRITE ? "已启用" : "已禁用");
      DEBUG_LOG("=============================================");
  }
  
