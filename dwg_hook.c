@@ -29,7 +29,8 @@
  #include <time.h>
  
  // ==================== 配置参数 ====================
- #define ENABLE_RENAME_FULL_REWRITE    1                    // 0:禁用/1:启用 - rename阶段整文件回写
+ #define ENABLE_INLINE_ENCRYPTION      1                    // 0:禁用/1:启用 - 在线加密（方案2）
+ #define ENABLE_FINAL_FILE_ENCRYPTION  1                    // 0:禁用/1:启用 - 整文件替换加密（方案1）
  #define WRITE_BLOCK_SIZE              (512 * 1024)         // 写入分块大小：512KB
  #define MMAP_CRYPT_BLOCK              (2UL * 1024 * 1024)  // 内存加解密分块：2MB
  #define MAX_PATH_LEN                  4096
@@ -183,10 +184,10 @@
      // 检测临时文件
      node->is_temp_file = (!node->is_target_dwg && path && 
                           (strstr(path, ".tmp") || strstr(path, "temp") || strstr(path, "~") ||
-                           strstr(path, "zwTm") || strstr(path, "zwsave")));
+                            strstr(path, "zwTm") || strstr(path, "zwsave") || strstr(path, ".bak")));
      
-     // 方案2：临时文件也需要加密写入（防止明文落盘）
-     node->should_encrypt_on_write = node->is_target_dwg || node->is_temp_file;
+     // 【方案2】临时文件和目标DWG文件都需要加密写入（防止明文落盘）
+     node->should_encrypt_on_write = ENABLE_INLINE_ENCRYPTION && (node->is_target_dwg || node->is_temp_file);
      
      
      node->next = fd_table;
@@ -198,9 +199,6 @@
                   node->is_target_dwg ? "是" : "否",
                   node->is_temp_file ? "是" : "否",
                   node->should_encrypt_on_write ? "是" : "否");
-     } else if (node->is_temp_file) {
-         DEBUG_LOG("添加临时文件上下文（方案2）: fd=%d, 路径=%s, 需要写入加密=%s", 
-                  fd, path ? path : "(空)", node->should_encrypt_on_write ? "是" : "否");
      }
      
      pthread_mutex_unlock(&fd_table_mutex);
@@ -563,6 +561,13 @@
  // 原子替换：对现有文件做整文件加密并原子覆盖（内部IO短路保护）
  static int encrypt_entire_file_inplace(const char *path) {
      if (!path) return -1;
+     
+     // 检查是否启用整文件加密
+     if (!ENABLE_FINAL_FILE_ENCRYPTION) {
+         DEBUG_LOG("整文件加密已禁用，跳过: %s", path);
+         return 0;
+     }
+     
      BEGIN_INTERNAL_IO();
  
      // 打开源文件只读
@@ -629,9 +634,10 @@
          return -1;
      }
  
-     // 最好再一次 fsync 所在目录以保证目录条目持久化
+     // 对目录fsync，保证目录条目持久化
      char dirpath[MAX_PATH_LEN];
      strncpy(dirpath, path, sizeof(dirpath)-1);
+     dirpath[sizeof(dirpath)-1] = '\0';
      char *slash = strrchr(dirpath, '/');
      if (slash) {
          *slash = '\0';
@@ -700,7 +706,7 @@
  
  // 文件关闭时写回所有相关私有副本
  static void flush_private_copies_on_close(int original_fd) {
-     if (!ENABLE_RENAME_FULL_REWRITE) {
+     if (!ENABLE_FINAL_FILE_ENCRYPTION) {
          DEBUG_LOG("已禁用close时私有副本写回: fd=%d", original_fd);
          return;
      }
@@ -734,46 +740,6 @@
  }
  
  // ==================== 系统调用Hook实现 ====================
- 
- // 【方案2增强】openat Hook - 支持相对路径的打开操作（只保留一个版本）
- int openat(int dirfd, const char *pathname, int flags, ...) {
-     static int (*real_openat)(int, const char *, int, mode_t) = NULL;
-     if (!real_openat) {
-         real_openat = dlsym(RTLD_NEXT, "openat");
-         DEBUG_LOG("openat Hook已初始化: real_openat=%p", real_openat);
-     }
-     
-     mode_t mode = 0;
-     if (flags & O_CREAT) {
-         va_list args;
-         va_start(args, flags);
-         mode = (mode_t)va_arg(args, int);
-         va_end(args);
-     }
-     
-     // 【方案2】检查是否为临时文件，如果是则标记需要写入加密
-     if (pathname && is_temporary_file(pathname)) {
-         DEBUG_LOG("【方案2】检测到临时文件（openat）: %s", pathname);
-     }
-     
-     int fd = real_openat(dirfd, pathname, flags, mode);
-     if (fd >= 0) {
-         // 构建完整路径（如果需要的话）
-         char *full_path = NULL;
-         if (pathname && pathname[0] != '/') {
-             // 相对路径需要结合 dirfd 来构建完整路径
-             // 简化处理：直接使用相对路径名
-             full_path = strdup(pathname);
-         } else {
-             full_path = pathname ? strdup(pathname) : NULL;
-         }
-         
-         fd_context_add(fd, full_path);
-         
-         if (full_path) free(full_path);
-     }
-     return fd;
- }
  
  // open系列函数Hook
  int open(const char *pathname, int flags, ...) {
@@ -868,7 +834,7 @@
              DEBUG_LOG("关闭目标DWG文件，执行收尾检查: fd=%d, 路径=%s", 
                       fd, ctx.path ? ctx.path : "(未知)");
              final_seal_if_needed(fd);
-             if (ENABLE_RENAME_FULL_REWRITE) {
+             if (ENABLE_FINAL_FILE_ENCRYPTION) {
                  flush_private_copies_on_close(fd);
              }
          }
@@ -1383,7 +1349,7 @@
          final_seal_if_needed(fd);
          
          // 如果启用了整文件回写，则执行
-         if (ENABLE_RENAME_FULL_REWRITE) {
+         if (ENABLE_FINAL_FILE_ENCRYPTION) {
              pthread_mutex_lock(&mmap_table_mutex);
              for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
                  mmap_region_t *region = &mmap_regions[i];
@@ -1445,7 +1411,7 @@
          final_seal_if_needed(fd);
          
          // 如果启用了整文件回写，则执行
-         if (ENABLE_RENAME_FULL_REWRITE) {
+         if (ENABLE_FINAL_FILE_ENCRYPTION) {
              pthread_mutex_lock(&mmap_table_mutex);
              for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
                  mmap_region_t *region = &mmap_regions[i];
@@ -1521,7 +1487,7 @@
              mark_path_encrypt_on_write(newpath, 1);
              
              // 如果启用了整文件回写，则执行（默认禁用）
-             if (ENABLE_RENAME_FULL_REWRITE) {
+             if (ENABLE_FINAL_FILE_ENCRYPTION) {
                  pthread_mutex_lock(&mmap_table_mutex);
                  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
                      mmap_region_t *region = &mmap_regions[i];
@@ -1617,7 +1583,7 @@
              mark_path_encrypt_on_write(newpath, 1);
              
              // 如果启用了整文件回写，则执行（默认禁用）
-             if (ENABLE_RENAME_FULL_REWRITE) {
+             if (ENABLE_FINAL_FILE_ENCRYPTION) {
                  pthread_mutex_lock(&mmap_table_mutex);
                  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
                      mmap_region_t *region = &mmap_regions[i];
@@ -1689,18 +1655,16 @@
      
      DEBUG_LOG("=============================================");
      DEBUG_LOG("DWG文件透明加解密Hook库 - 双方案修复版本");
-     DEBUG_LOG("方案1: 进程内明文编辑（mmap私有副本）");
-     DEBUG_LOG("方案2: 临时文件写入时直接加密");
-     DEBUG_LOG("【方案1】mmap私有副本机制: 已启用");
-     DEBUG_LOG("【方案2】临时文件写入加密: 已启用");
-     DEBUG_LOG("【双保险】两套方案同时工作，确保无明文落盘");
+     DEBUG_LOG("【方案1】整文件替换加密: %s", ENABLE_FINAL_FILE_ENCRYPTION ? "已启用" : "已禁用");
+     DEBUG_LOG("【方案2】在线加密（临时文件写入时直接加密）: %s", ENABLE_INLINE_ENCRYPTION ? "已启用" : "已禁用");
+     DEBUG_LOG("【整合方案】两套方案协同工作，确保无明文落盘");
      DEBUG_LOG("功能: 进程内明文编辑，磁盘保持密文状态");
-     DEBUG_LOG("双保险机制: 方案1(mmap私有副本) + 方案2(临时文件写入加密)");
+     DEBUG_LOG("双保险机制: 方案1(整文件替换) + 方案2(在线加密)");
      DEBUG_LOG("调试模式: %s", is_debug_enabled() ? "已启用" : "已禁用");
-     DEBUG_LOG("方案1状态: 已启用 (mmap MAP_SHARED->MAP_PRIVATE)");
-     DEBUG_LOG("方案2状态: 已启用 (临时文件写入时直接加密)");
+     DEBUG_LOG("mmap私有副本机制: 已启用 (MAP_SHARED->MAP_PRIVATE)");
      DEBUG_LOG("编译时间: %s %s", __DATE__, __TIME__);
-     DEBUG_LOG("整文件回写模式: %s", ENABLE_RENAME_FULL_REWRITE ? "已启用" : "已禁用");
+     DEBUG_LOG("方案1-整文件加密: %s", ENABLE_FINAL_FILE_ENCRYPTION ? "已启用" : "已禁用");
+     DEBUG_LOG("方案2-在线加密: %s", ENABLE_INLINE_ENCRYPTION ? "已启用" : "已禁用");
      DEBUG_LOG("=============================================");
  }
  
