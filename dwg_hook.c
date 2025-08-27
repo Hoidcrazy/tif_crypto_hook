@@ -29,7 +29,7 @@
  #include <time.h>
  
  // ==================== 配置参数 ====================
- #define ENABLE_RENAME_FULL_REWRITE    0                    // 0:禁用/1:启用 - rename阶段整文件回写
+ #define ENABLE_RENAME_FULL_REWRITE    1                    // 0:禁用/1:启用 - rename阶段整文件回写
  #define WRITE_BLOCK_SIZE              (512 * 1024)         // 写入分块大小：512KB
  #define MMAP_CRYPT_BLOCK              (2UL * 1024 * 1024)  // 内存加解密分块：2MB
  #define MAX_PATH_LEN                  4096
