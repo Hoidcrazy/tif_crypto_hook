@@ -331,7 +331,6 @@ static void mark_mmap_modified_by_fd(int fd) {
     }
     pthread_mutex_unlock(&mmap_table_mutex);
 }
-static void sync_memory_regions_after_encryption(const char *path);
 
 // ==================== XOR加解密算法（高性能版本） ====================
 static void xor_encrypt_decrypt_optimized(unsigned char *data, size_t size) {
@@ -559,48 +558,6 @@ static int decrypt_memory_region(void *addr, size_t length, int target_protectio
     return chunked_memory_crypto(addr, length, "内存解密", target_protection);
 }
 
-// 在文件加密后同步内存映射区域
-static void sync_memory_regions_after_encryption(const char *file_path) {
-    if (!file_path) return;
-    
-    DEBUG_LOG("开始同步内存映射区域: %s", file_path);
-    
-    pthread_mutex_lock(&mmap_table_mutex);
-    int synced_count = 0;
-    
-    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-        mmap_region_t *region = &mmap_regions[i];
-        if (!region->addr || !region->is_target_dwg) continue;
-        
-        // 检查是否是相同文件的映射
-        if (region->file_path && strcmp(region->file_path, file_path) == 0) {
-            DEBUG_LOG("同步内存区域: 地址=%p, 长度=%zu", region->addr, region->length);
-            
-            // 临时修改内存保护为可写
-            void *aligned_start = NULL;
-            size_t aligned_length = 0;
-            align_to_pages(region->addr, region->length, &aligned_start, &aligned_length);
-            
-            int original_prot = region->prot;
-            if (mprotect(aligned_start, aligned_length, PROT_READ | PROT_WRITE) == 0) {
-                // 对内存区域进行加密，使其与磁盘文件状态一致
-                xor_encrypt_decrypt_optimized((unsigned char *)region->addr, region->length);
-                synced_count++;
-                
-                // 恢复原始内存保护
-                mprotect(aligned_start, aligned_length, original_prot);
-                
-                DEBUG_LOG("内存区域同步完成: 地址=%p", region->addr);
-            } else {
-                DEBUG_LOG("内存区域同步失败：无法修改保护属性 - %s", strerror(errno));
-            }
-        }
-    }
-    
-    pthread_mutex_unlock(&mmap_table_mutex);
-    DEBUG_LOG("内存同步完成，共处理%d个区域", synced_count);
-}
-
 // 原地在同一 inode 上进行整文件加密覆盖（避免使用临时文件 rename）
 // 这样可以保持 inode 不变，避免 CAD 检测到“文件被外部替换/保护”。
 // 注意：此实现会逐块读取原文件并在同一偏移写回加密块，使用 pread/pwrite 保证线程安全。
@@ -689,9 +646,6 @@ static int encrypt_entire_file_inplace(const char *path) {
 
     free(buf);
     close(fd);
-
-    // ⚠️ 不再同步内存映射为密文（保持进程内为明文，避免 CAD 认为文件被保护）
-    // sync_memory_regions_after_encryption(path);
 
     END_INTERNAL_IO();
     return 0;
